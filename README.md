@@ -1,3 +1,14 @@
+> ⚠️ **Important Notice**  
+>
+> This fan project is _not affiliated with or endorsed by [17Lands](https://17lands.com/)_.
+>
+> _**No longer maintained, functional, or updated as of June 2023.**_
+>
+> Members of the community have continued supporting this project through [GitHub forks](https://github.com/bstaple1/MTGA_Draft_17Lands/forks).  
+> If you're interested in exploring further, consider trying one of these forks **at your own risk**.
+>
+> Thank you for your interest and support!
+
 # MTGA_Draft_17Lands
 Magic: The Gathering Arena draft tool that utilizes 17Lands data.
 

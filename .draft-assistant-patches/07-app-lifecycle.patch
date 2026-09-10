@@ -1,0 +1,157 @@
+diff --git a/src/ui/app.py b/src/ui/app.py
+--- a/src/ui/app.py
++++ b/src/ui/app.py
+@@
+ from src.ui.card_interactions import CardInteractionManager
+ from src.ui.windows.overlay import CompactOverlay
+ from src.ui.windows.settings import SettingsWindow
++from src.auto_launch import ArenaPresenceMonitor, set_auto_launch_enabled
+
+ # Delegated Managers
+ from src.ui.app_layout import AppLayoutManager
+@@
+-    def __init__(self, root: tkinter.Tk, scanner, configuration):
++    def __init__(
++        self,
++        root: tkinter.Tk,
++        scanner,
++        configuration,
++        started_in_background: bool = False,
++    ):
+         self.root = root
+         self.configuration = configuration
++        self.started_in_background = started_in_background
+
+         # 1. IMMEDIATE STATE INITIALIZATION
+@@
+         self.current_draft_id = ""
++        self._presence_monitor = None
++        self._arena_seen = False
++        self._user_hidden = False
+
+         # 2. INITIAL THEME APPLICATION
+@@
+     # DELEGATED CONTROLLER METHODS
+     # =========================================================================
+     def _perform_boot_sync(self):
+         self.controller.start_boot_sync()
++        self._start_presence_monitor()
++        if not self.configuration.settings.first_run_complete:
++            self.root.after(500, self._show_first_run_setup)
+@@
+             if key == "always_on_top" or key is None:
+                 self.root.attributes("-topmost", s.always_on_top)
++            if key == "launch_with_arena" or key is None:
++                if s.launch_with_arena:
++                    self._start_presence_monitor()
++                else:
++                    self._stop_presence_monitor()
+             if key == "draft_log_enabled" or key is None:
+                 self.orchestrator.scanner.log_enable(s.draft_log_enabled)
+@@
+     def _disable_overlay(self):
+         if self.overlay_window:
+             self.overlay_window.destroy()
+@@
+         )
+         self._refresh_ui_data()
+
++    def _show_first_run_setup(self):
++        """Show the one-time, nontechnical Arena integration setup."""
++        if self.configuration.settings.first_run_complete:
++            return
++        try:
++            from src.ui.windows.first_run import FirstRunSetupWindow
++
++            FirstRunSetupWindow(
++                self.root,
++                self.configuration,
++                on_complete=self._on_first_run_complete,
++            )
++        except Exception as e:
++            logger.error(f"Could not show first-run setup: {e}", exc_info=True)
++
++    def _on_first_run_complete(self, enabled: bool):
++        if enabled:
++            self._start_presence_monitor()
++        else:
++            self._stop_presence_monitor()
++
++    def _start_presence_monitor(self):
++        """Keep a lightweight watch on Arena after auto-launch is enabled."""
++        if not self.configuration.settings.launch_with_arena:
++            return
++
++        # Refresh the startup entry on each normal run.  This repairs stale
++        # paths automatically if the application was moved after installation.
++        ok, error = set_auto_launch_enabled(True)
++        if not ok:
++            logger.warning(f"Could not refresh automatic startup registration: {error}")
++
++        if self._presence_monitor is None:
++            self._presence_monitor = ArenaPresenceMonitor(
++                self.root,
++                lambda: self.configuration.settings.arena_log_location,
++                self._on_arena_started,
++                self._on_arena_stopped,
++            )
++        self._presence_monitor.start()
++
++    def _stop_presence_monitor(self):
++        if self._presence_monitor is not None:
++            self._presence_monitor.stop()
++
++    def _on_arena_started(self):
++        self._arena_seen = True
++        self._user_hidden = False
++        self._show_from_background()
++
++    def _on_arena_stopped(self):
++        if not self._arena_seen:
++            return
++        self._user_hidden = False
++        self._hide_for_background(user_requested=False)
++
++    def _show_from_background(self):
++        try:
++            if self.overlay_window and self.overlay_window.winfo_exists():
++                self.overlay_window.deiconify()
++                self.overlay_window.lift()
++            else:
++                self.root.deiconify()
++                self.root.lift()
++        except tkinter.TclError:
++            pass
++
++    def _hide_for_background(self, user_requested: bool = False):
++        self._user_hidden = bool(user_requested)
++        try:
++            if self.overlay_window and self.overlay_window.winfo_exists():
++                self.overlay_window.withdraw()
++            self.root.withdraw()
++        except tkinter.TclError:
++            pass
++
+     def _on_close(self):
+-        """Save geometry and sash state before closing."""
++        """Hide to background when auto-launch is active; otherwise quit."""
++        if self.configuration.settings.launch_with_arena:
++            try:
++                self.layout_manager.save_window_state()
++                write_configuration(self.configuration)
++            except Exception as e:
++                logger.error(f"Error saving window state: {e}")
++            self._hide_for_background(user_requested=True)
++            return
++
++        self._quit()
++
++    def _quit(self):
++        """Actually terminate the application, including background monitoring."""
+         try:
+             self.layout_manager.save_window_state()
+             write_configuration(self.configuration)
++            self._stop_presence_monitor()
+             if hasattr(self, "orchestrator"):
+                 self.orchestrator.stop()
+         except Exception as e:

@@ -237,3 +237,79 @@ def test_composition_bonus_heuristics(mock_metrics):
     mult, reason = advisor._calculate_composition_bonus({"tags": ["removal"]}, pack=2)
     assert mult == 1.3
     assert "Critical: Needs Removal" in reason
+
+
+def test_main_archetype_uses_dataset_wubrg_order(mock_metrics):
+    """Two-color keys must match Dataset.normalize_color_string()."""
+    pool = []
+    for _ in range(8):
+        pool.append(
+            {
+                "colors": ["U"],
+                "types": ["Creature"],
+                "deck_colors": {"All Decks": {"gihwr": 60.0}},
+            }
+        )
+        pool.append(
+            {
+                "colors": ["B"],
+                "types": ["Creature"],
+                "deck_colors": {"All Decks": {"gihwr": 60.0}},
+            }
+        )
+
+    advisor = DraftAdvisor(mock_metrics, pool)
+    assert advisor.main_archetype == "UB"
+
+
+def test_archetype_weight_moves_as_pool_grows_and_reads_gih_samples(mock_metrics):
+    """A card that excels in our lane should rise as the draft progresses."""
+    advisor = DraftAdvisor(mock_metrics, [])
+    advisor.main_archetype = "UB"
+
+    card = {
+        "name": "UB Glue Card",
+        "colors": ["U"],
+        "deck_colors": {
+            "All Decks": {"gihwr": 55.0, "gih": 5000},
+            # The real dataset uses `gih` as the GIHWR sample-count field.
+            "UB": {"gihwr": 61.0, "gih": 2000},
+        },
+    }
+
+    early_score = advisor._calculate_weighted_score(card, pick_number=1)
+
+    # Simulate reaching the late draft.  The score should now trust UB-specific
+    # performance much more heavily.
+    advisor.pool = [{} for _ in range(40)]
+    late_score = advisor._calculate_weighted_score(card, pick_number=11)
+
+    assert late_score > early_score
+    assert late_score > 60.0
+
+
+def test_display_rating_is_bounded_monotonic_and_centered(mock_metrics):
+    advisor = DraftAdvisor(mock_metrics, [])
+
+    low = advisor._to_display_rating(20.0)
+    middle = advisor._to_display_rating(50.0)
+    high = advisor._to_display_rating(80.0)
+    huge = advisor._to_display_rating(10000.0)
+
+    assert 0.0 <= low < middle < high <= 100.0
+    assert middle == pytest.approx(50.0)
+    assert huge <= 100.0
+
+
+def test_basic_land_keeps_zero_display_rating(mock_metrics):
+    advisor = DraftAdvisor(mock_metrics, [])
+    pack = [
+        {
+            "name": "Island",
+            "colors": ["U"],
+            "types": ["Land", "Basic"],
+            "deck_colors": {"All Decks": {"gihwr": 0.0}},
+        }
+    ]
+    recs = advisor.evaluate_pack(pack, current_pick=1)
+    assert recs[0].contextual_score == 0.0

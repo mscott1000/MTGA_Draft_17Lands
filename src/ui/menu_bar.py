@@ -40,7 +40,10 @@ class AppMenuBar:
         file_m.add_command(label="Export Draft (CSV)", command=self._export_csv)
         file_m.add_command(label="Export Draft (JSON)", command=self._export_json)
         file_m.add_separator()
-        file_m.add_command(label="Exit", command=self.app_context._on_close)
+        # The window close button may intentionally hide the app when
+        # "Open automatically with MTG Arena" is enabled.  File -> Quit is the
+        # explicit way to terminate the background helper.
+        file_m.add_command(label="Quit", command=self.app_context._quit)
 
         # --- TOOLS MENU ---
         tools_m = tkinter.Menu(m, tearoff=0)

@@ -52,6 +52,25 @@ macOS actively quarantines unsigned apps downloaded from the internet. To run th
 - **Step 6:** Configure the tool through `File -> Preferences...`.
 - **Step 7:** Start a draft or sealed event in MTG Arena!
 
+### Zero-to-Automatic Startup
+
+For nontechnical users, the recommended one-time setup is:
+
+1. Install and open **MTGA Draft Tool** once.
+2. In MTG Arena, open **Options -> Account** and enable **Detailed Logs (Plugin Support)**.
+3. In the Draft Tool's first-time setup window, leave
+   **Open Draft Assistant automatically with MTG Arena** checked and click
+   **Finish Setup**.
+4. That's it. On future computer logins, the Draft Tool waits silently in the
+   background. Opening MTG Arena causes the Draft Tool to appear automatically.
+
+No administrator access is required. Closing the Draft Tool window while this
+option is enabled hides it in the background; use **File -> Quit** when you
+actually want to stop it for the rest of the current login session.
+
+You can change this behavior later under **File -> Preferences -> Open
+automatically with MTG Arena**.
+
 ---
 
 ## Run Steps: Python (Windows / macOS / Linux)

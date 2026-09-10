@@ -241,6 +241,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-f", "--file", help="Path to Player.log")
     parser.add_argument("-d", "--data", help="Path to MTGA Data")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="Wait quietly for MTG Arena before showing the application",
+    )
     parser.add_argument("--version", action="store_true", help="Print version and exit")
     args, _ = parser.parse_known_args()
 
@@ -252,6 +257,24 @@ def main():
 
     # Load Config
     config, _ = read_configuration()
+
+    # Auto-launch mode is intentionally cheap: no Tk window, dataset sync, or
+    # scanner is created until Arena actually exists.
+    from src.auto_launch import InstanceLock, wait_for_arena
+
+    if args.background:
+        if not config.settings.launch_with_arena:
+            return
+        wait_for_arena(config.settings.arena_log_location)
+
+    # The login-time watcher deliberately does not take this lock while it is
+    # waiting, so manually opening the app first is still possible.  When Arena
+    # later starts, the waiting copy sees the active instance and exits.
+    instance_lock = InstanceLock()
+    if not instance_lock.acquire():
+        logger.info("Another MTGA Draft Tool instance is already running.")
+        return
+
     root = None
 
     def launch_ui(is_safe_mode=False):
@@ -283,7 +306,12 @@ def main():
             try:
                 splash.close()
                 root.update()
-                app = DraftApp(root, data["scanner"], data["config"])
+                app = DraftApp(
+                    root,
+                    data["scanner"],
+                    data["config"],
+                    started_in_background=args.background,
+                )
 
                 # 1. Show the window skeleton immediately
                 root.deiconify()
@@ -301,7 +329,10 @@ def main():
             root,
             task=lambda cb: load_data(args, config, cb),
             on_complete=on_ready,
-            show_ui=getattr(config.settings, "show_splash_screen", True),
+            show_ui=(
+                getattr(config.settings, "show_splash_screen", True)
+                and not args.background
+            ),
         )
 
     try:
@@ -319,6 +350,8 @@ def main():
         if root:
             root.destroy()
         sys.exit(0)
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":

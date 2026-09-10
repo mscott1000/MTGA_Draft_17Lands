@@ -1,0 +1,57 @@
+diff --git a/src/ui/windows/settings.py b/src/ui/windows/settings.py
+--- a/src/ui/windows/settings.py
++++ b/src/ui/windows/settings.py
+@@
+         features = [
+             ("Always On Top", "always_on_top"),
++            ("Open automatically with MTG Arena", "launch_with_arena"),
+             ("Auto-Sync Cloud Datasets", "auto_sync_datasets"),
+             ("Highlight Row by Mana Cost", "card_colors_enabled"),
+             ("Check for Dataset Updates", "update_notifications_enabled"),
+@@
+         checkbox_keys = [
+             "always_on_top",
++            "launch_with_arena",
+             "auto_sync_datasets",
+             "card_colors_enabled",
+             "update_notifications_enabled",
+@@
+     def _on_setting_changed(self, key: str):
+         """Persists single change and notifies the main application."""
+         val = self.vars[key].get()
+
+         # Handle type conversion
+         if isinstance(val, int) and key != "result_format":
+             bool_val = bool(val)
++
++            if key == "launch_with_arena":
++                from src.auto_launch import set_auto_launch_enabled
++
++                ok, error = set_auto_launch_enabled(bool_val)
++                if not ok:
++                    # Revert both model and checkbox without re-entering this
++                    # trace callback.
++                    self._toggle_traces(False)
++                    self.vars[key].set(int(self.configuration.settings.launch_with_arena))
++                    self._toggle_traces(True)
++                    messagebox.showerror(
++                        "Automatic Startup Could Not Be Changed",
++                        "The Draft Assistant could not update your startup settings.\n\n"
++                        f"{error}",
++                        parent=self,
++                    )
++                    return
++
+             setattr(self.configuration.settings, key, bool_val)
+             val = bool_val
+         else:
+@@
+     def _reset_defaults(self):
+         """Restores pro-level baseline configuration."""
+         if messagebox.askyesno("Confirm Reset", "Restore all settings to default?"):
++            # Resetting preferences must also remove any OS-level startup hook.
++            from src.auto_launch import set_auto_launch_enabled
++
++            set_auto_launch_enabled(False)
+             reset_configuration()
+             from src.configuration import read_configuration

@@ -38,7 +38,10 @@ jobs:
         run: poetry install --no-interaction
 
       - name: Run focused tests
-        run: poetry run pytest tests/test_advisor_engine.py tests/test_auto_launch.py -q
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 &
+          poetry run pytest tests/test_advisor_engine.py tests/test_auto_launch.py -q
 
       - name: Commit tested changes
         run: |

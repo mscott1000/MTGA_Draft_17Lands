@@ -1,5 +1,4 @@
 from pathlib import Path
-import re
 
 ROOT = Path(__file__).resolve().parents[1]
 PATCH_DIR = ROOT / ".draft-assistant-patches"
@@ -36,6 +35,16 @@ def hunk_strings(lines):
             continue
         if not line:
             continue
+
+        # Some staged patches were authored with visually blank context lines
+        # rather than the formal unified-diff spelling of " <newline>". Treat
+        # those as context so the source matcher sees the real surrounding
+        # blank line instead of silently deleting it from the search string.
+        if line in ("\n", "\r\n"):
+            old_parts.append(line)
+            new_parts.append(line)
+            continue
+
         marker = line[0]
         body = line[1:]
         if marker in (" ", "-"):

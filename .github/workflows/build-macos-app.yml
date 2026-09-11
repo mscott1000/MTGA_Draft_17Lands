@@ -2,6 +2,15 @@ name: Build macOS App
 
 on:
   workflow_dispatch:
+  push:
+    branches: ["draft-assistant-dev"]
+    paths:
+      - ".github/workflows/build-macos-app.yml"
+      - "src/**"
+      - "main.py"
+      - "main.spec"
+      - "pyproject.toml"
+      - "poetry.lock"
 
 jobs:
   build:

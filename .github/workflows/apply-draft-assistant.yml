@@ -1,0 +1,53 @@
+name: Apply Draft Assistant Changes
+
+on:
+  push:
+    branches: ["draft-assistant-dev"]
+    paths:
+      - ".draft-assistant-patches/**"
+      - ".github/workflows/apply-draft-assistant.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: draft-assistant-dev
+          fetch-depth: 0
+
+      - name: Apply staged source changes
+        run: python .draft-assistant-patches/apply_changes.py
+
+      - name: Syntax check
+        run: python -m compileall -q src main.py
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Run focused tests
+        run: |
+          export DISPLAY=:99
+          Xvfb :99 &
+          poetry run pytest tests/test_advisor_engine.py tests/test_auto_launch.py -q
+
+      - name: Commit tested changes
+        run: |
+          rm -rf .draft-assistant-patches
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add adaptive ratings and Arena auto-launch"
+          git push origin HEAD:draft-assistant-dev

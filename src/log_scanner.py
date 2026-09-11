@@ -1,12 +1,31 @@
-"""This module contains the functions that are used for parsing the Arena log"""
+"""
+src/log_scanner.py
+
+This module contains the ArenaScanner class used for parsing the Arena log
+and managing the state of the current draft (packs, picks, event info).
+"""
+
 import os
 import json
 import re
 import logging
+import threading
+import time
+from enum import Enum
+from datetime import datetime
+
 import src.constants as constants
-import src.card_logic as CL
-import src.file_extractor as FE
 from src.logger import create_logger
+from src.set_metrics import SetMetrics
+from src.dataset import Dataset
+from src.tier_list import TierList
+from src.utils import (
+    process_json,
+    json_find,
+    retrieve_local_set_list,
+    detect_string,
+    normalize_color_string,
+)
 
 if not os.path.exists(constants.DRAFT_LOG_FOLDER):
     os.makedirs(constants.DRAFT_LOG_FOLDER)
@@ -16,79 +35,122 @@ LOG_TYPE_DRAFT = "draftLog"
 logger = create_logger()
 
 
-def retrieve_card_data(set_data, card):
-    card_data = {}
-    if (set_data is not None) and (card in set_data["card_ratings"]):
-        card_data = set_data["card_ratings"][card]
-    else:
-        empty_dict = {constants.DATA_FIELD_NAME: card,
-                      constants.DATA_FIELD_MANA_COST: "",
-                      constants.DATA_FIELD_TYPES: [],
-                      constants.DATA_SECTION_IMAGES: []}
-        FE.initialize_card_data(empty_dict)
-        card_data = empty_dict
-    return card_data
+class Source(Enum):
+    REFRESH = 1
+    UPDATE = 2
 
 
 class ArenaScanner:
-    '''Class that handles the processing of the information within Arena Player.log file'''
+    """Class that handles the processing of the information within Arena Player.log file"""
 
-    def __init__(self, filename, set_list, sets_location: str = constants.SETS_FOLDER, step_through: bool = False):
+    def __init__(
+        self,
+        filename,
+        set_list,
+        sets_location: str = constants.SETS_FOLDER,
+        step_through: bool = False,
+        retrieve_unknown: bool = False,
+        db_path: str = None,
+    ):
         self.arena_file = filename
         self.set_list = set_list
         self.draft_log = logging.getLogger(LOG_TYPE_DRAFT)
         self.draft_log.setLevel(logging.INFO)
         self.sets_location = sets_location
+        self.state_file = os.path.join(constants.TEMP_FOLDER, "active_draft_state.json")
+
+        # CENTRAL DATA LOCK: Co-ordinates UI and Background Threading
+        self.lock = threading.RLock()
 
         self.logging_enabled = False
-
         self.step_through = step_through
-        self.set_data = None
+        self.set_data = Dataset(retrieve_unknown, db_path)
+        self.tier_list = TierList()
         self.draft_type = constants.LIMITED_TYPE_UNKNOWN
+
+        # File Pointers
         self.pick_offset = 0
         self.pack_offset = 0
+        self.pool_offset = 0
         self.search_offset = 0
         self.draft_start_offset = 0
+        self.file_size = 0
+
+        # State Trackers
         self.draft_sets = []
         self.current_pick = 0
         self.current_pack = 0
-        self.picked_cards = [[] for i in range(8)]
+        self.number_of_players = 8
+
+        self.picked_cards = [[] for _ in range(self.number_of_players)]
+        self.pack_cards = [[] for _ in range(self.number_of_players)]
+        self.initial_pack = [[] for _ in range(self.number_of_players)]
         self.taken_cards = []
         self.sideboard = []
-        self.pack_cards = [[]] * 8
-        self.initial_pack = [[]] * 8
+
+        self.previous_scanned_pack = 0
         self.previous_picked_pack = 0
         self.current_picked_pick = 0
-        self.file_size = 0
+
         self.data_source = "None"
         self.event_string = ""
+        self.current_transaction_id = ""
+        self.draft_label = ""
+        self.draft_history = []
+        self.current_draft_id = ""
+        self.draft_start_time = ""
+        self._last_seen_timestamp = "Unknown"
+        self._load_state()
 
     def set_arena_file(self, filename):
-        '''Public function that's used for storing the location of the Player.log file'''
-        self.arena_file = filename
+        """Updates the log path and resets pointers for a clean scan."""
+        with self.lock:
+            if self.arena_file != filename:
+                logger.info(f"Scanner path updated to: {filename}")
+                self.arena_file = filename
+                self.search_offset = 0
+                self.draft_start_offset = 0
+                self.file_size = 0
+                self.clear_draft(True)
+
+                # Do not write to past draft logs
+                if os.path.basename(filename).startswith("DraftLog_"):
+                    self.log_enable(False)
 
     def log_enable(self, enable):
-        '''Enable/disable the application draft log feature that records draft data in a log file within the Logs folder'''
-        self.logging_enabled = enable
-        self.log_suspend(not enable)
+        """Enable/disable the application draft log feature"""
+        with self.lock:
+            self.logging_enabled = enable
+            self.log_suspend(not enable)
 
     def log_suspend(self, suspended):
-        '''Prevents the application from updating the draft log file'''
-        if suspended:
-            self.draft_log.setLevel(logging.CRITICAL)
-        elif self.logging_enabled:
-            self.draft_log.setLevel(logging.INFO)
+        """Prevents the application from updating the draft log file"""
+        with self.lock:
+            if suspended:
+                self.draft_log.setLevel(logging.CRITICAL)
+            elif self.logging_enabled:
+                self.draft_log.setLevel(logging.INFO)
 
     def __new_log(self, card_set, event, draft_id):
-        '''Create a new draft log file'''
+        """Create a new draft log file"""
+        if not self.logging_enabled:
+            return
+
         try:
             log_name = f"DraftLog_{card_set}_{event}_{draft_id}.log"
             log_path = os.path.join(constants.DRAFT_LOG_FOLDER, log_name)
+
+            # Prevent writing to the file we are currently reading
+            if os.path.abspath(self.arena_file) == os.path.abspath(log_path):
+                return
+
             for handler in self.draft_log.handlers:
                 if isinstance(handler, logging.FileHandler):
                     self.draft_log.removeHandler(handler)
+                    handler.close()
             formatter = logging.Formatter(
-                '%(asctime)s,%(message)s', datefmt='<%d%m%Y %H:%M:%S>')
+                "%(asctime)s,%(message)s", datefmt="<%d%m%Y %H:%M:%S>"
+            )
             new_handler = logging.FileHandler(log_path, delay=True)
             new_handler.setFormatter(formatter)
             self.draft_log.addHandler(new_handler)
@@ -96,115 +158,268 @@ class ArenaScanner:
         except Exception as error:
             logger.error(error)
 
+    def _load_state(self, target_draft_id=None):
+        """Recovers the active draft state if the app was closed mid-draft."""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+
+                # If an ID is provided, strictly match it.
+                if target_draft_id is not None and str(
+                    state.get("current_draft_id", "")
+                ) != str(target_draft_id):
+                    return False
+
+                self.draft_type = state.get(
+                    "draft_type", constants.LIMITED_TYPE_UNKNOWN
+                )
+                # States saved before v4.19 could hold an event-name string
+                # (e.g. "ContenderDraft"), which matches no parser dispatch.
+                if not isinstance(self.draft_type, int):
+                    self.draft_type = constants.LIMITED_TYPES_DICT.get(
+                        self.draft_type, constants.LIMITED_TYPE_UNKNOWN
+                    )
+                self.draft_sets = state.get("draft_sets", [])
+                self.draft_label = state.get("draft_label", "")
+                self.event_string = state.get("event_string", "")
+                self.current_draft_id = state.get("current_draft_id", "")
+                self.current_transaction_id = state.get("current_transaction_id", "")
+                self.number_of_players = state.get("number_of_players", 8)
+                self.taken_cards = state.get("taken_cards", [])
+                self.picked_cards = state.get(
+                    "picked_cards", [[] for _ in range(self.number_of_players)]
+                )
+                self.initial_pack = state.get(
+                    "initial_pack", [[] for _ in range(self.number_of_players)]
+                )
+                self.pack_cards = state.get(
+                    "pack_cards", [[] for _ in range(self.number_of_players)]
+                )
+                self.current_pack = state.get("current_pack", 0)
+                self.current_pick = state.get("current_pick", 0)
+                self.previous_scanned_pack = state.get("previous_scanned_pack", 0)
+                self.previous_picked_pack = state.get("previous_picked_pack", 0)
+                self.current_picked_pick = state.get("current_picked_pick", 0)
+                self.draft_history = state.get("draft_history", [])
+                self.draft_start_time = state.get("draft_start_time", "")
+
+                if self.draft_type != constants.LIMITED_TYPE_UNKNOWN:
+                    logger.info(
+                        f"Restored previous draft state: {self.event_string} (Pack {self.current_pack}, Pick {self.current_pick})"
+                    )
+
+                return True
+        except Exception as e:
+            logger.error(f"Failed to load draft state: {e}")
+        return False
+
+    def _save_state(self):
+        """Persists the memory state to disk to survive application crashes."""
+        try:
+            state = {
+                "draft_type": self.draft_type,
+                "draft_sets": self.draft_sets,
+                "draft_label": self.draft_label,
+                "event_string": self.event_string,
+                "current_draft_id": self.current_draft_id,
+                "current_transaction_id": getattr(self, "current_transaction_id", ""),
+                "number_of_players": self.number_of_players,
+                "taken_cards": self.taken_cards,
+                "picked_cards": self.picked_cards,
+                "initial_pack": self.initial_pack,
+                "pack_cards": self.pack_cards,
+                "current_pack": self.current_pack,
+                "current_pick": self.current_pick,
+                "previous_scanned_pack": self.previous_scanned_pack,
+                "previous_picked_pack": self.previous_picked_pack,
+                "current_picked_pick": self.current_picked_pick,
+                "draft_history": self.draft_history,
+                "draft_start_time": self.draft_start_time,
+            }
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception as e:
+            logger.error(f"Failed to save draft state: {e}")
+
     def clear_draft(self, full_clear):
-        '''Clear the stored draft data collected from the Player.log file'''
-        if full_clear:
-            self.search_offset = 0
-            self.draft_start_offset = 0
-            self.file_size = 0
-        self.set_data = None
-        self.draft_type = constants.LIMITED_TYPE_UNKNOWN
-        self.pick_offset = 0
-        self.pack_offset = 0
-        self.draft_sets = None
-        self.current_pick = 0
-        self.picked_cards = [[] for i in range(8)]
-        self.taken_cards = []
-        self.sideboard = []
-        self.pack_cards = [[]] * 8
-        self.initial_pack = [[]] * 8
-        self.current_pack = 0
-        self.previous_picked_pack = 0
-        self.current_picked_pick = 0
-        self.data_source = "None"
+        with self.lock:
+            if full_clear:
+                self.search_offset = 0
+                self.draft_start_offset = 0
+                self.file_size = 0
+                self.current_transaction_id = ""
+                if os.path.exists(self.state_file):
+                    try:
+                        os.remove(self.state_file)
+                    except:
+                        pass
+                self.set_data.clear()
+
+            self.draft_type = constants.LIMITED_TYPE_UNKNOWN
+            self.pick_offset = 0
+            self.pack_offset = 0
+            self.pool_offset = 0
+            self.draft_sets = None
+            self.current_pick = 0
+            self.current_pack = 0
+            self.previous_scanned_pack = 0
+            self.previous_picked_pack = 0
+            self.current_picked_pick = 0
+            self.number_of_players = 8
+            self.picked_cards = [[] for _ in range(self.number_of_players)]
+            self.pack_cards = [[] for _ in range(self.number_of_players)]
+            self.initial_pack = [[] for _ in range(self.number_of_players)]
+            self.taken_cards = []
+            self.sideboard = []
+            self.data_source = "None"
+            self.draft_label = ""
+            self.draft_history = []
+            self.current_draft_id = ""
+            self.event_string = ""
+            self.draft_start_time = ""
+            if not full_clear:
+                self._save_state()
 
     def draft_start_search(self):
-        '''Search for the string that represents the start of a draft'''
+        """Search for the string that represents the start of a draft"""
+
+        with self.lock:
+            try:
+                arena_file_size = os.path.getsize(self.arena_file)
+                if self.file_size > arena_file_size:
+                    self.clear_draft(True)
+                    logger.info(
+                        "New Arena Log Detected (%d), (%d)",
+                        self.file_size,
+                        arena_file_size,
+                    )
+                self.file_size = arena_file_size
+                offset = self.search_offset
+            except Exception:
+                return False
+
         update = False
         event_type = ""
         event_line = ""
         draft_id = ""
 
         try:
-            # Check if a new player.log was created (e.g. application was started before Arena was started)
-            arena_file_size = os.path.getsize(self.arena_file)
-            if self.file_size > arena_file_size:
-                self.clear_draft(True)
-                logger.info(
-                    "New Arena Log Detected (%d), (%d)", self.file_size, arena_file_size)
-            self.file_size = arena_file_size
-            offset = self.search_offset
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
+            with open(self.arena_file, "r", encoding="utf-8", errors="replace") as log:
                 log.seek(offset)
                 while True:
                     line = log.readline()
                     if not line:
                         break
+                    if not line.endswith("\n") and not line.endswith("\r"):
+                        break
+
                     offset = log.tell()
-                    self.search_offset = offset
-                    for start_string in constants.DRAFT_START_STRINGS:
-                        if start_string in line:
-                            self.draft_start_offset = offset
-                            string_offset = line.find(start_string)
-                            event_data = json.loads(
-                                line[string_offset + len(start_string):])
-                            update, event_type, draft_id = self.__check_event(
-                                event_data)
+
+                    with self.lock:
+                        self.search_offset = offset
+
+                    if line.startswith("[UnityCrossThreadLogger]"):
+                        content = line[24:].strip()
+                        if content and content[0].isdigit() and (":" in content):
+                            with self.lock:
+                                self._last_seen_timestamp = content
+
+                    start_offset = detect_string(line, constants.DRAFT_START_STRINGS)
+
+                    if start_offset != -1:
+                        entry_string = line[start_offset:]
+                        event_data = process_json(entry_string)
+                        is_new, et, did = self.__check_event(event_data)
+                        if is_new:
+                            update = True
+                            event_type = et
+                            draft_id = did
                             event_line = line
+                            with self.lock:
+                                self.draft_start_offset = offset
+                                self.draft_start_time = self._last_seen_timestamp
+
+                    elif "InternalEventName" in line and "CardPool" in line:
+                        try:
+                            json_start = line.find("{")
+                            if json_start != -1:
+                                event_data = process_json(line[json_start:])
+                                internal_name = json_find(
+                                    "InternalEventName", event_data
+                                )
+                                if internal_name:
+                                    dummy_payload = {"EventName": internal_name}
+                                    is_new, et, did = self.__check_event(dummy_payload)
+                                    if is_new:
+                                        update = True
+                                        event_type = et
+                                        draft_id = did
+                                        event_line = line
+                                        card_pool = json_find("CardPool", event_data)
+                                        with self.lock:
+                                            self.draft_start_offset = offset
+                                            if card_pool:
+                                                self.taken_cards = [
+                                                    str(c) for c in card_pool
+                                                ]
+                        except Exception as e:
+                            logger.error(f"Error parsing Deck Recovery line: {e}")
 
             if update:
-                self.__new_log(self.draft_sets[0], event_type, draft_id)
-                self.draft_log.info(event_line)
-                self.pick_offset = self.draft_start_offset
-                self.pack_offset = self.draft_start_offset
-                logger.info(
-                    "New draft detected %s, %s", event_type, self.draft_sets)
+                with self.lock:
+                    if self.draft_sets:
+                        self.__new_log(self.draft_sets[0], event_type, draft_id)
+                    self.draft_log.info(event_line.strip())
+                    self.pick_offset = self.draft_start_offset
+                    self.pack_offset = self.draft_start_offset
+                    self.pool_offset = self.draft_start_offset
         except Exception as error:
             logger.error(error)
 
         return update
 
     def __check_event(self, event_data):
-        '''Parse a draft start string and extract pertinent information'''
+        """Parse a draft start string and extract pertinent information"""
         update = False
         event_type = ""
         draft_id = ""
         try:
-            draft_id = event_data["id"]
-            request_data = json.loads(event_data["request"])
-            payload_data = json.loads(request_data["Payload"])
-            event_name = payload_data["EventName"]
+            raw_id = json_find("id", event_data)
+            draft_id = str(raw_id) if raw_id is not None else ""
+            event_name = json_find("EventName", event_data)
+
+            with self.lock:
+                current_event_string = self.event_string
+                current_transaction_id = str(
+                    getattr(self, "current_transaction_id", "")
+                )
+
+            if current_event_string == event_name:
+                if current_transaction_id == draft_id:
+                    return update, event_type, draft_id
+                if json_find("EntryCurrencyType", event_data) is None:
+                    return update, event_type, draft_id
 
             logger.info("Event found %s", event_name)
+            event_match, event_type, event_label, event_set, number_of_players = (
+                self.__check_special_event(event_name)
+            )
+            if not event_match:
+                event_match, event_type, event_label, event_set, number_of_players = (
+                    self.__check_standard_event(event_name)
+                )
 
-            event_sections = event_name.split('_')
-
-            # Find event type in event string
-            events = [i for i in constants.LIMITED_TYPES_DICT
-                      for x in event_sections if i in x]
-            if not events and [i for i in constants.DRAFT_DETECTION_CATCH_ALL for x in event_sections if i in x]:
-                # Unknown draft events will be parsed as premier drafts
-                events.append(constants.LIMITED_TYPE_STRING_DRAFT_PREMIER)
-
-            if events:
-                # Find set name within the event string
-                sets = [i.seventeenlands[0] for i in self.set_list.data.values(
-                ) for x in event_sections if i.seventeenlands[0].lower() in x.lower()]
-                # Remove duplicates while retaining order
-                sets = list(dict.fromkeys(sets))
-
-                sets = ["UNKN"] if not sets else sets
-
-                if events[0] == constants.LIMITED_TYPE_STRING_SEALED:
-                    # Trad_Sealed_NEO_20220317
-                    event_type = constants.LIMITED_TYPE_STRING_TRAD_SEALED if "Trad" in event_sections else constants.LIMITED_TYPE_STRING_SEALED
-                else:
-                    event_type = events[0]
-                draft_type = constants.LIMITED_TYPES_DICT[event_type]
+            if event_match:
                 self.clear_draft(False)
-                self.draft_type = draft_type
-                self.draft_sets = sets
-                self.event_string = event_name
+                with self.lock:
+                    self.draft_type = constants.LIMITED_TYPES_DICT[event_type]
+                    self.draft_sets = event_set
+                    self.draft_label = event_label
+                    self.event_string = event_name
+                    self.current_transaction_id = draft_id
+                    self.number_of_players = number_of_players
+                    self._save_state()
                 update = True
 
         except Exception as error:
@@ -212,969 +427,899 @@ class ArenaScanner:
 
         return update, event_type, draft_id
 
-    def draft_data_search(self):
-        '''Collect draft data from the Player.log file based on the current active format'''
-        update = False
-        previous_pick = self.current_pick
-        previous_pack = self.current_pack
-        previous_picked = self.current_picked_pick
+    def __check_special_event(self, event_name):
+        for event in self.set_list.special_events:
+            if event.type in constants.LIMITED_TYPES_DICT and all(
+                x in event_name for x in event.keywords
+            ):
+                number_of_players = (
+                    4
+                    if constants.PICK_TWO_EVENT_STRING in event_name
+                    else event.number_of_players
+                )
+                return (
+                    True,
+                    event.type,
+                    event.label[:12],
+                    [event.set_code],
+                    number_of_players,
+                )
+        return False, "", "", "", 8
 
-        if self.draft_type == constants.LIMITED_TYPE_DRAFT_PREMIER_V1:
-            if len(self.initial_pack[0]) == 0:
-                self.__draft_pack_search_premier_p1p1()
-            self.__draft_pack_search_premier_v1()
-            self.__draft_picked_search_premier_v1()
-        elif self.draft_type == constants.LIMITED_TYPE_DRAFT_PREMIER_V2:
-            if len(self.initial_pack[0]) == 0:
-                self.__draft_pack_search_premier_p1p1()
-            self.__draft_pack_search_premier_v2()
-            self.__draft_picked_search_premier_v2()
-        elif self.draft_type == constants.LIMITED_TYPE_DRAFT_QUICK:
-            self.__draft_pack_search_quick()
-            self.__draft_picked_search_quick()
-        elif self.draft_type == constants.LIMITED_TYPE_DRAFT_TRADITIONAL:
-            if len(self.initial_pack[0]) == 0:
-                self.__draft_pack_search_traditional_p1p1()
-            self.__draft_pack_search_traditional()
-            self.__draft_picked_search_traditional()
-        elif ((self.draft_type == constants.LIMITED_TYPE_SEALED)
-                or (self.draft_type == constants.LIMITED_TYPE_SEALED_TRADITIONAL)):
-            update = self.__sealed_pack_search()
-            if not update:
-                update = self.__sealed_pack_search_v2()
-        if not update:
-            if ((previous_pack != self.current_pack) or
-                (previous_pick != self.current_pick) or
-                    (previous_picked != self.current_picked_pick)):
+    def __check_standard_event(self, event_name):
+        event_match = False
+        event_type = ""
+        event_label = ""
+        event_set = []
+        number_of_players = 8
+        event_sections = event_name.split("_")
+
+        events = [
+            i for i in constants.LIMITED_TYPES_DICT for x in event_sections if i in x
+        ]
+        if not events and [
+            i
+            for i in constants.DRAFT_DETECTION_CATCH_ALL
+            for x in event_sections
+            if i in x
+        ]:
+            events.append(constants.LIMITED_TYPE_STRING_DRAFT_PREMIER)
+
+        if events:
+            upper_sections = [sec.upper() for sec in event_sections]
+            for i in sorted(
+                self.set_list.data.values(), key=lambda v: len(v.set_code), reverse=True
+            ):
+                if not i.set_code:
+                    continue
+                normalized_code = i.set_code.replace("-", " ").replace("CUBE", " CUBE ")
+                code_parts = normalized_code.split()
+                if all(
+                    any(part.upper() in sec for sec in upper_sections)
+                    for part in code_parts
+                ):
+                    event_set = [i.set_code]
+                    break
+
+            if not event_set:
+                for section in event_sections:
+                    if any(ev in section for ev in events) or section.isdigit():
+                        continue
+                    if section.upper() in ["TRAD", "COMP", "BOT", "PICK", "TWO"]:
+                        continue
+                    if 3 <= len(section) <= 4 and section.isalnum():
+                        event_set = [section.upper()]
+                        break
+
+            event_set = ["UNKN"] if not event_set else event_set
+
+            if events[0] == constants.LIMITED_TYPE_STRING_SEALED:
+                event_type = (
+                    constants.LIMITED_TYPE_STRING_TRAD_SEALED
+                    if "Trad" in event_sections
+                    else constants.LIMITED_TYPE_STRING_SEALED
+                )
+            else:
+                event_type = events[0]
+
+            event_label = event_type
+            event_match = True
+            number_of_players = (
+                4 if constants.PICK_TWO_EVENT_STRING in event_name else 8
+            )
+
+        return event_match, event_type, event_label, event_set, number_of_players
+
+    # =========================================================================
+    # CORE MODULAR LOGIC ENGINES
+    # =========================================================================
+
+    def _scan_log_for_events(self, offset_attr: str, search_strings: list):
+        """A robust generator that handles all file IO and yielding of JSON payloads. Completely lock-free during IO."""
+        offset = getattr(self, offset_attr, 0)
+
+        try:
+            with open(self.arena_file, "r", encoding="utf-8", errors="replace") as log:
+                log.seek(offset)
+                while True:
+                    line = log.readline()
+                    if not line:
+                        break
+                    if not line.endswith("\n") and not line.endswith("\r"):
+                        break
+
+                    current_pos = log.tell()
+                    setattr(self, offset_attr, current_pos)
+
+                    if line.startswith("[UnityCrossThreadLogger]"):
+                        content = line[24:].strip()
+                        if content and content[0].isdigit() and (":" in content):
+                            self._last_seen_timestamp = content
+
+                    start_idx = detect_string(line, search_strings)
+                    if start_idx != -1:
+                        self.draft_log.info(line.strip())
+                        # Ensure we grab the start of the valid JSON dictionary
+                        json_start = line.find("{")
+                        if json_start != -1:
+                            yield line[json_start:]
+                        else:
+                            yield line[start_idx:]
+        except Exception as e:
+            logger.error(f"Error scanning {search_strings}: {e}")
+
+    def _parse_events(
+        self, offset_attr: str, search_strings: list, extractor_func: callable
+    ) -> bool:
+        """Generic event processor that DRYs up JSON parsing, looping, and error handling."""
+        update = False
+
+        flat_search = []
+        for s in search_strings:
+            if isinstance(s, list):
+                flat_search.extend(s)
+            else:
+                flat_search.append(s)
+
+        for payload in self._scan_log_for_events(offset_attr, flat_search):
+            try:
+                draft_data = process_json(payload)
+                if not draft_data:
+                    try:
+                        draft_data = json.loads(payload)
+                    except Exception:
+                        pass
+
+                if draft_data and extractor_func(draft_data):
+                    update = True
+
+                if self.step_through:
+                    break
+            except Exception as e:
+                logger.error(f"Parse Error for {flat_search}: {e}")
+        return update
+
+    def _process_pack_data(
+        self,
+        pack: int,
+        pick: int,
+        pack_cards: list,
+        draft_id: str = None,
+    ):
+        """Universal handler for processing pack permutations across all Draft formats."""
+        if not pack or not pick or not pack_cards:
+            return False
+
+        with self.lock:
+            self._check_and_wipe_stale_pool(pack, pick, pack_cards, draft_id)
+
+            expected_players = (
+                4
+                if self.draft_type
+                in [
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+                ]
+                else 8
+            )
+            self.number_of_players = expected_players
+
+            # Handle Pack Transitions securely
+            if (
+                pack > self.previous_scanned_pack
+                or len(self.initial_pack) != expected_players
+            ):
+                self.initial_pack = [[] for _ in range(expected_players)]
+                self.pack_cards = [[] for _ in range(expected_players)]
+                self.previous_scanned_pack = pack
+            elif pack < self.previous_scanned_pack:
+                # Ignore severely delayed logs from a completely different pack to prevent memory corruption
+                return False
+
+            pack_index = (pick - 1) % expected_players
+
+            # Prevent duplicate processing of the exact same pack
+            if (
+                len(self.pack_cards) > pack_index
+                and self.pack_cards[pack_index] == pack_cards
+            ):
+                return False
+
+            # Commit Data safely
+            if len(self.initial_pack[pack_index]) == 0 and pick <= expected_players:
+                self.initial_pack[pack_index] = pack_cards
+
+            self.pack_cards[pack_index] = pack_cards
+
+            # Update High Watermark
+            is_new_high_watermark = False
+            if pack > self.current_pack or (
+                pack == self.current_pack and pick >= self.current_pick
+            ):
+                self.current_pack, self.current_pick = pack, pick
+                is_new_high_watermark = True
+
+            # Record History
+            self._record_pack(pack, pick, pack_cards)
+            self._save_state()
+
+        return is_new_high_watermark
+
+    def _process_pick_data(
+        self, pack: int, pick: int, cards: list, draft_id: str = None
+    ):
+        """Universal handler for processing human and bot picks."""
+        if not cards or not pack or not pick:
+            return False
+
+        with self.lock:
+            self._check_and_wipe_stale_pool(pack, pick, cards, draft_id)
+
+            # DYNAMIC EVENT UPGRADE: If MTGA mislabels a Pick-Two draft as a standard draft,
+            # detect it based on the number of cards in the first pick payload.
+            if len(cards) >= 2 and self.draft_type not in [
+                constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+                constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+                constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+            ]:
+                logger.info(
+                    f"Dynamically upgrading event to Pick-Two based on payload size: {len(cards)}"
+                )
+                if self.draft_type == constants.LIMITED_TYPE_DRAFT_TRADITIONAL:
+                    self.draft_type = constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD
+                elif self.draft_type == constants.LIMITED_TYPE_DRAFT_QUICK:
+                    self.draft_type = constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK
+                else:
+                    self.draft_type = constants.LIMITED_TYPE_DRAFT_PICK_TWO
+
+            # Enforce maximum cards per pick to prevent MTGA JSON array-bloat bugs
+            cards = cards[: self.cards_per_pick]
+
+            expected_players = (
+                4
+                if self.draft_type
+                in [
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+                ]
+                else 8
+            )
+            self.number_of_players = expected_players
+
+            # Prevent duplicate processing of historical picks when reconstructing state
+            if pack < self.previous_picked_pack:
+                return False
+            if pack == self.previous_picked_pack and pick <= self.current_picked_pick:
+                return False
+
+            pack_index = (pick - 1) % expected_players
+
+            if (
+                pack > self.previous_picked_pack
+                or len(self.picked_cards) != expected_players
+            ):
+                self.picked_cards = [[] for _ in range(expected_players)]
+
+            self.picked_cards[pack_index].extend(cards)
+            self.taken_cards.extend(cards)
+
+            self.previous_picked_pack = pack
+            self.current_picked_pick = pick
+
+            if pack > self.current_pack or (
+                pack == self.current_pack and pick >= self.current_pick
+            ):
+                self.current_pack, self.current_pick = pack, pick
+
+            self._save_state()
+        return True
+
+    def _check_and_wipe_stale_pool(self, pack, pick, current_cards, draft_id=None):
+        wipe = False
+        str_draft_id = str(draft_id) if draft_id else ""
+        str_current_id = str(self.current_draft_id) if self.current_draft_id else ""
+
+        # 1. Draft ID Exact Match Protection
+        if str_draft_id and str_current_id:
+            if str_draft_id != str_current_id:
+                wipe = True
+            else:
+                return  # Exact match! We are definitely re-reading history. Do not wipe!
+        elif str_draft_id and not str_current_id:
+            if not self._load_state(str_draft_id) and self.taken_cards:
+                wipe = True
+
+            # 2. Time-Travel Protection (When Draft ID is missing or new)
+            if not wipe:
+                if pack == 1 and pick == 1 and len(self.taken_cards) > 0:
+                    # STRICT WIPE: It is P1P1, but we have cards from an old draft.
+                    wipe = True
+                elif pack < self.current_pack or (
+                    pack == self.current_pack and pick < self.current_pick
+                ):
+                    # We are seeing an older pack/pick.
+                    is_historical = False
+                    if not current_cards:
+                        is_historical = True
+                    elif self.draft_history:
+                        for entry in self.draft_history:
+                            if entry["Pack"] == pack and entry["Pick"] == pick:
+                                if any(c in entry["Cards"] for c in current_cards):
+                                    is_historical = True
+                                break
+
+                    if not is_historical:
+                        wipe = True
+
+            elif pack == 1 and pick == 1 and self.taken_cards:
+                # If we see P1P1 and we already have a massive pool, we missed the end of the last draft.
+                if (
+                    len(self.taken_cards) > 15
+                    or self.current_pack > 1
+                    or self.current_pick > 1
+                ):
+                    wipe = True
+
+        if wipe:
+            logger.info(
+                f"Stale Pool Wiped. Trigger: Pack {pack} Pick {pick} vs Current P{self.current_pack}P{self.current_pick}"
+            )
+            self.taken_cards = []
+            self.picked_cards = [[] for _ in range(self.number_of_players)]
+            self.draft_history = []
+            self.sideboard = []
+            self.current_pack = 0
+            self.current_pick = 0
+            self.previous_picked_pack = 0
+            self.previous_scanned_pack = 0
+            self.current_picked_pick = 0
+            self.initial_pack = [[] for _ in range(self.number_of_players)]
+            self.pack_cards = [[] for _ in range(self.number_of_players)]
+
+        if str_draft_id and str_draft_id != str_current_id:
+            self.current_draft_id = str_draft_id
+            self._save_state()
+
+    # =========================================================================
+    # EVENT DISPATCHER
+    # =========================================================================
+
+    def draft_data_search(self):
+        update = False
+        changes = self.__perform_search_logic()
+
+        is_unknown = False
+        with self.lock:
+            is_unknown = self.draft_type == constants.LIMITED_TYPE_UNKNOWN
+
+        if is_unknown:
+            self.draft_start_search()
+
+        with self.lock:
+            if changes:
                 update = True
 
         return update
 
-    def __draft_pack_search_premier_p1p1(self):
-        '''Parse premier draft string that contains the P1P1 pack data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "CardsInPack"
-        pack_cards = []
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        # Remove any prefix (e.g. log timestamp)
-                        start_offset = line.find("{\"id\":")
-                        self.draft_log.info(line)
-                        draft_data = json.loads(line[start_offset:])
-                        request_data = draft_data["request"]
-                        payload_data = json.loads(request_data)["Payload"]
-
-                        pack_cards = []
-                        try:
-
-                            card_data = json.loads(payload_data)
-                            cards = card_data["CardsInPack"]
-
-                            for card in cards:
-                                pack_cards.append(str(card))
-
-                            pack = card_data["PackNumber"]
-                            pick = card_data["PickNumber"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.current_pack != pack:
-                                self.initial_pack = [[]] * 8
-
-                            if len(self.initial_pack[pack_index]) == 0:
-                                self.initial_pack[pack_index] = pack_cards
-
-                            self.pack_cards[pack_index] = pack_cards
-
-                            if (self.current_pack == 0) and (self.current_pick == 0):
-                                self.current_pack = pack
-                                self.current_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_pack_search_premier_p1p1 Sub Error: %s", error)
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_pack_search_premier_p1p1 Error: %s", error)
-
-        return pack_cards
-
-    def __draft_picked_search_premier_v1(self):
-        '''Parse the premier draft string that contains the player pick information'''
-        offset = self.pick_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]==> Event_PlayerDraftMakePick "
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.pick_offset = offset
-                        start_offset = line.find("{\"id\"")
-                        self.draft_log.info(line)
-
-                        try:
-                            # Identify the pack
-                            draft_data = json.loads(line[start_offset:])
-
-                            request_data = json.loads(draft_data["request"])
-                            param_data = json.loads(request_data["Payload"])
-
-                            pack = int(param_data["Pack"])
-                            pick = int(param_data["Pick"])
-                            card = str(param_data["GrpId"])
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.previous_picked_pack != pack:
-                                self.picked_cards = [[] for i in range(8)]
-
-                            self.picked_cards[pack_index].append(card)
-                            self.taken_cards.append(card)
-
-                            self.previous_picked_pack = pack
-                            self.current_picked_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_picked_search_premier_v1 Error: %s", error)
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_picked_search_premier_v1 Error: %s", error)
-
-    def __draft_pack_search_premier_v1(self):
-        '''Parse the premier draft string that contains the non-P1P1 pack data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]Draft.Notify "
-        pack_cards = []
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.pack_offset = offset
-                        start_offset = line.find("{\"draftId\"")
-                        self.draft_log.info(line)
-                        pack_cards = []
-                        # Identify the pack
-                        draft_data = json.loads(line[start_offset:])
-                        try:
-
-                            cards = draft_data["PackCards"].split(',')
-
-                            for card in cards:
-                                pack_cards.append(str(card))
-
-                            pack = draft_data["SelfPack"]
-                            pick = draft_data["SelfPick"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.current_pack != pack:
-                                self.initial_pack = [[]] * 8
-
-                            if len(self.initial_pack[pack_index]) == 0:
-                                self.initial_pack[pack_index] = pack_cards
-
-                            self.pack_cards[pack_index] = pack_cards
-
-                            self.current_pack = pack
-                            self.current_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_pack_search_premier_v1 Error: %s", error)
-
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_pack_search_premier_v1 Error: %s", error)
-        return pack_cards
-
-    def __draft_pack_search_premier_v2(self):
-        '''Parse the premier draft string that contains the non-P1P1 pack data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]Draft.Notify "
-        pack_cards = []
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.pack_offset = offset
-                        self.draft_log.info(line)
-                        pack_cards = []
-                        # Identify the pack
-                        draft_data = json.loads(line[len(draft_string):])
-                        try:
-
-                            cards = draft_data["PackCards"].split(',')
-
-                            for card in cards:
-                                pack_cards.append(str(card))
-
-                            pack = draft_data["SelfPack"]
-                            pick = draft_data["SelfPick"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.current_pack != pack:
-                                self.initial_pack = [[]] * 8
-
-                            if len(self.initial_pack[pack_index]) == 0:
-                                self.initial_pack[pack_index] = pack_cards
-
-                            self.pack_cards[pack_index] = pack_cards
-
-                            self.current_pack = pack
-                            self.current_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_pack_search_premier_v2 Error: %s", error)
-
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_pack_search_premier_v2 Error: %s", error)
-        return pack_cards
-
-    def __draft_picked_search_premier_v2(self):
-        '''Parse the premier draft string that contains the player pick data'''
-        offset = self.pick_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]==> Draft.MakeHumanDraftPick "
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.draft_log.info(line)
-                        self.pick_offset = offset
-                        try:
-                            # Identify the pack
-                            draft_data = json.loads(line[len(draft_string):])
-
-                            request_data = json.loads(draft_data["request"])
-                            param_data = request_data["params"]
-
-                            pack = int(param_data["packNumber"])
-                            pick = int(param_data["pickNumber"])
-                            card = param_data["cardId"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.previous_picked_pack != pack:
-                                self.picked_cards = [[] for i in range(8)]
-
-                            self.picked_cards[pack_index].append(card)
-                            self.taken_cards.append(card)
-
-                            self.previous_picked_pack = pack
-                            self.current_picked_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_picked_search_premier_v2 Error: %s", error)
-
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_picked_search_premier_v2 Error: %s", error)
-
-    def __draft_pack_search_quick(self):
-        '''Parse the quick draft string that contains the current pack data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "DraftPack"
-        pack_cards = []
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.pack_offset = offset
-                        # Remove any prefix (e.g. log timestamp)
-                        start_offset = line.find("{\"CurrentModule\"")
-                        self.draft_log.info(line)
-                        draft_data = json.loads(line[start_offset:])
-                        payload_data = json.loads(draft_data["Payload"])
-                        pack_data = payload_data["DraftPack"]
-                        draft_status = payload_data["DraftStatus"]
-
-                        if draft_status == "PickNext":
-                            pack_cards = []
-                            try:
-
-                                cards = pack_data
-
-                                for card in cards:
-                                    pack_cards.append(str(card))
-
-                                pack = payload_data["PackNumber"] + 1
-                                pick = payload_data["PickNumber"] + 1
-                                pack_index = (pick - 1) % 8
-
-                                if self.current_pack != pack:
-                                    self.initial_pack = [[]] * 8
-
-                                if len(self.initial_pack[pack_index]) == 0:
-                                    self.initial_pack[pack_index] = pack_cards
-
-                                self.pack_cards[pack_index] = pack_cards
-
-                                self.current_pack = pack
-                                self.current_pick = pick
-
-                                if self.step_through:
-                                    break
-
-                            except Exception as error:
-                                self.draft_log.info(
-                                    "__draft_pack_search_quick Error: %s", error)
-        except Exception as error:
-            self.draft_log.info("__draft_pack_search_quick Error: %s", error)
-
-        return pack_cards
-
-    def __draft_picked_search_quick(self):
-        '''Parse the quick draft string that contains the player pick data'''
-        offset = self.pick_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]==> BotDraft_DraftPick "
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.draft_log.info(line)
-                        self.pick_offset = offset
-                        try:
-                            # Identify the pack
-                            draft_data = json.loads(
-                                line[string_offset+len(draft_string):])
-
-                            request_data = json.loads(draft_data["request"])
-                            payload_data = json.loads(request_data["Payload"])
-                            pick_data = payload_data["PickInfo"]
-
-                            pack = pick_data["PackNumber"] + 1
-                            pick = pick_data["PickNumber"] + 1
-                            card = pick_data["CardId"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.previous_picked_pack != pack:
-                                self.picked_cards = [[] for i in range(8)]
-
-                            self.previous_picked_pack = pack
-                            self.current_picked_pick = pick
-
-                            self.picked_cards[pack_index].append(card)
-                            self.taken_cards.append(card)
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_picked_search_quick Error: %s", error)
-        except Exception as error:
-            self.draft_log.info("__draft_picked_search_quick Error: %s", error)
-
-    def __draft_pack_search_traditional_p1p1(self):
-        '''Parse the traditional draft string that contains the P1P1 pack data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "CardsInPack"
-        pack_cards = []
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        # Remove any prefix (e.g. log timestamp)
-                        start_offset = line.find("{\"id\":")
-                        self.draft_log.info(line)
-                        draft_data = json.loads(line[start_offset:])
-                        request_data = draft_data["request"]
-                        payload_data = json.loads(request_data)["Payload"]
-
-                        pack_cards = []
-                        try:
-
-                            card_data = json.loads(payload_data)
-                            cards = card_data["CardsInPack"]
-
-                            for card in cards:
-                                pack_cards.append(str(card))
-
-                            pack = card_data["PackNumber"]
-                            pick = card_data["PickNumber"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.current_pack != pack:
-                                self.initial_pack = [[]] * 8
-
-                            if len(self.initial_pack[pack_index]) == 0:
-                                self.initial_pack[pack_index] = pack_cards
-
-                            self.pack_cards[pack_index] = pack_cards
-
-                            if (self.current_pack == 0) and (self.current_pick == 0):
-                                self.current_pack = pack
-                                self.current_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_pack_search_traditional_p1p1 Error: %s", error)
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_pack_search_traditional_p1p1 Error: %s", error)
-
-        return pack_cards
-
-    def __draft_picked_search_traditional(self):
-        '''Parse the traditional draft string that contains the player pick data'''
-        offset = self.pick_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]==> Event_PlayerDraftMakePick "
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.pick_offset = offset
-                        start_offset = line.find("{\"id\"")
-                        self.draft_log.info(line)
-
-                        try:
-                            # Identify the pack
-                            draft_data = json.loads(line[start_offset:])
-
-                            request_data = json.loads(draft_data["request"])
-                            param_data = json.loads(request_data["Payload"])
-
-                            pack = int(param_data["Pack"])
-                            pick = int(param_data["Pick"])
-                            card = str(param_data["GrpId"])
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.previous_picked_pack != pack:
-                                self.picked_cards = [[] for i in range(8)]
-
-                            self.picked_cards[pack_index].append(card)
-                            self.taken_cards.append(card)
-
-                            self.previous_picked_pack = pack
-                            self.current_picked_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_picked_search_traditional Error: %s", error)
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_picked_search_traditional Error: %s", error)
-
-    def __draft_pack_search_traditional(self):
-        '''Parse the quick draft string that contains the non-P1P1 pack data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "[UnityCrossThreadLogger]Draft.Notify "
-        pack_cards = []
-        pack = 0
-        pick = 0
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    string_offset = line.find(draft_string)
-
-                    if string_offset != -1:
-                        self.pack_offset = offset
-                        start_offset = line.find("{\"draftId\"")
-                        self.draft_log.info(line)
-                        pack_cards = []
-                        # Identify the pack
-                        draft_data = json.loads(line[start_offset:])
-                        try:
-
-                            cards = draft_data["PackCards"].split(',')
-
-                            for card in cards:
-                                pack_cards.append(str(card))
-
-                            pack = draft_data["SelfPack"]
-                            pick = draft_data["SelfPick"]
-
-                            pack_index = (pick - 1) % 8
-
-                            if self.current_pack != pack:
-                                self.initial_pack = [[]] * 8
-
-                            if len(self.initial_pack[pack_index]) == 0:
-                                self.initial_pack[pack_index] = pack_cards
-
-                            self.pack_cards[pack_index] = pack_cards
-
-                            self.current_pack = pack
-                            self.current_pick = pick
-
-                            if self.step_through:
-                                break
-
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__draft_pack_search_traditional Error: %s", error)
-
-        except Exception as error:
-            self.draft_log.info(
-                "__draft_pack_search_traditional Error: %s", error)
-        return pack_cards
-
-    def __sealed_pack_search(self):
-        '''Parse sealed string that contains all of the card data'''
-        offset = self.pack_offset
-        draft_data = object()
-        draft_string = "EventGrantCardPool"
+    def __perform_search_logic(self):
+        """Dispatches log scanning safely lock-free."""
+        with self.lock:
+            pk, pi = self.current_pack, self.current_pick
+            pp = self.current_picked_pick
+
+        explicit_update = False
+
+        # RECOVERY MODE: If the app restarts mid-draft and misses EventJoin,
+        # infer the draft type from the active log events.
+        if self.draft_type == constants.LIMITED_TYPE_UNKNOWN:
+            if self._search_pack_notify() or self._search_pick_human():
+                self.draft_type = constants.LIMITED_TYPE_DRAFT_PREMIER_V2
+                self.number_of_players = 8
+                explicit_update = True
+            elif self._search_pack_bot() or self._search_pick_bot():
+                self.draft_type = constants.LIMITED_TYPE_DRAFT_QUICK
+                self.number_of_players = 8
+                explicit_update = True
+            elif self._search_card_pool():
+                self.draft_type = constants.LIMITED_TYPE_SEALED
+                explicit_update = True
+
+        if self.draft_type == constants.LIMITED_TYPE_DRAFT_PREMIER_V1:
+            explicit_update |= self._search_pick_v1()
+            explicit_update |= self._search_pack_notify()
+            explicit_update |= self._search_card_pool()
+        elif self.draft_type in [
+            constants.LIMITED_TYPE_DRAFT_PREMIER_V2,
+            constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+            constants.LIMITED_TYPE_DRAFT_TRADITIONAL,
+            constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+            # Contender drafts are human live drafts (Premier protocol)
+            constants.LIMITED_TYPE_DRAFT_CONTENDER,
+        ]:
+            explicit_update |= self._search_pick_human()
+            explicit_update |= self._search_pack_notify()
+            explicit_update |= self._search_card_pool()
+        elif self.draft_type in [
+            constants.LIMITED_TYPE_DRAFT_QUICK,
+            constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+        ]:
+            explicit_update |= self._search_pick_bot()
+            explicit_update |= self._search_pack_bot()
+            explicit_update |= self._search_card_pool()
+        elif self.draft_type in [
+            constants.LIMITED_TYPE_SEALED,
+            constants.LIMITED_TYPE_SEALED_TRADITIONAL,
+        ]:
+            explicit_update |= self._search_card_pool()
+
+        with self.lock:
+            return bool(
+                (pk != self.current_pack)
+                or (pi != self.current_pick)
+                or (pp != self.current_picked_pick)
+                or explicit_update
+            )
+
+    # =========================================================================
+    # MODULAR PARSERS
+    # =========================================================================
+
+    def _search_pack_notify(self) -> bool:
+        def _extract(data):
+            cards_raw = json_find("PackCards", data)
+            if not cards_raw:
+                return False
+
+            p_val = json_find("SelfPack", data)
+            pi_val = json_find("SelfPick", data)
+            pack = int(p_val) if p_val is not None else 0
+            pick = int(pi_val) if pi_val is not None else 0
+
+            draft_id = json_find("DraftId", data)
+            if draft_id is None:
+                draft_id = json_find("draftId", data)
+
+            pack_cards = (
+                [str(c) for c in cards_raw]
+                if isinstance(cards_raw, list)
+                else str(cards_raw).split(",")
+            )
+
+            return self._process_pack_data(
+                pack=pack,
+                pick=pick,
+                pack_cards=pack_cards,
+                draft_id=str(draft_id) if draft_id else "",
+            )
+
+        return self._parse_events(
+            "pack_offset", [constants.DRAFT_PACK_STRING_PREMIER], _extract
+        )
+
+    def _search_pick_human(self) -> bool:
+        def _extract(data):
+            grp_ids = json_find("GrpIds", data)
+            if grp_ids is None:
+                grp_ids = json_find("cardIds", data)
+
+            if grp_ids is not None and isinstance(grp_ids, list):
+                cards = [str(x) for x in grp_ids if str(x) != "0"]
+            else:
+                grp_id = json_find("GrpId", data)
+                if grp_id is None:
+                    grp_id = json_find("cardId", data)
+                if grp_id is None:
+                    grp_id = json_find("PickGrpId", data)
+                cards = (
+                    [str(grp_id)] if grp_id is not None and str(grp_id) != "0" else []
+                )
+
+            if not cards:
+                return False
+
+            p_val = json_find("Pack", data)
+            if p_val is None:
+                p_val = json_find("packNumber", data)
+            pi_val = json_find("Pick", data)
+            if pi_val is None:
+                pi_val = json_find("pickNumber", data)
+
+            pack = int(p_val) if p_val is not None else 0
+            pick = int(pi_val) if pi_val is not None else 0
+
+            draft_id = json_find("DraftId", data)
+            if draft_id is None:
+                draft_id = json_find("draftId", data)
+
+            return self._process_pick_data(
+                pack=pack,
+                pick=pick,
+                cards=cards,
+                draft_id=str(draft_id) if draft_id else "",
+            )
+
+        return self._parse_events(
+            "pick_offset", [constants.DRAFT_PICK_STRING_PREMIER], _extract
+        )
+
+    def _search_pick_v1(self) -> bool:
+        def _extract(data):
+            p_val = json_find("Pack", data)
+            pi_val = json_find("Pick", data)
+            pack = int(p_val) if p_val is not None else 0
+            pick = int(pi_val) if pi_val is not None else 0
+
+            grp_id = json_find("GrpId", data)
+            cards = [str(grp_id)] if grp_id is not None and str(grp_id) != "0" else []
+            if not cards:
+                return False
+
+            draft_id = json_find("DraftId", data)
+            if draft_id is None:
+                draft_id = json_find("draftId", data)
+
+            return self._process_pick_data(
+                pack=pack,
+                pick=pick,
+                cards=cards,
+                draft_id=str(draft_id) if draft_id else "",
+            )
+
+        return self._parse_events(
+            "pick_offset", [constants.DRAFT_PICK_STRING_PREMIER_OLD], _extract
+        )
+
+    def _search_pack_bot(self) -> bool:
+        def _extract(data):
+            if json_find("DraftStatus", data) != "PickNext":
+                return False
+            cards = json_find("DraftPack", data)
+            if not cards:
+                return False
+
+            p_val = json_find("PackNumber", data)
+            pi_val = json_find("PickNumber", data)
+            # Bot drafts are 0-indexed! So we add 1.
+            pack = int(p_val) + 1 if p_val is not None else 1
+            pick = int(pi_val) + 1 if pi_val is not None else 1
+
+            pack_cards = (
+                [str(c) for c in cards]
+                if isinstance(cards, list)
+                else str(cards).split(",")
+            )
+            changed = self._process_pack_data(pack, pick, pack_cards)
+
+            # Quick draft explicit taken cards sync
+            picked = json_find("PickedCards", data)
+            if picked:
+                picked_list = (
+                    [str(c) for c in picked]
+                    if isinstance(picked, list)
+                    else str(picked).split(",")
+                )
+                if len(picked_list) > len(self.taken_cards):
+                    self.taken_cards = picked_list
+                    self.picked_cards[0] = self.taken_cards
+                    changed = True
+            return changed
+
+        return self._parse_events(
+            "pack_offset", [constants.DRAFT_PACK_STRING_QUICK], _extract
+        )
+
+    def _search_pick_bot(self) -> bool:
+        def _extract(data):
+            cids = json_find("CardIds", data)
+            if cids is None:
+                cids = json_find("cardIds", data)
+
+            if cids is not None and isinstance(cids, list):
+                cards = [str(x) for x in cids if str(x) != "0"]
+            else:
+                cid = json_find("CardId", data)
+                if cid is None:
+                    cid = json_find("cardId", data)
+                cards = [str(cid)] if cid is not None and str(cid) != "0" else []
+
+            if not cards:
+                return False
+
+            p_val = json_find("PackNumber", data)
+            pi_val = json_find("PickNumber", data)
+            pack = int(p_val) + 1 if p_val is not None else 1
+            pick = int(pi_val) + 1 if pi_val is not None else 1
+
+            return self._process_pick_data(
+                pack=pack,
+                pick=pick,
+                cards=cards,
+            )
+
+        return self._parse_events(
+            "pick_offset", [constants.DRAFT_PICK_STRING_QUICK], _extract
+        )
+
+    def _search_card_pool(self):
         update = False
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
+        for payload in self._scan_log_for_events("pool_offset", ['"CardPool":[']):
+            try:
+                data = process_json(payload)
+                if not data:
+                    continue
+                pool = []
 
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
+                with self.lock:
+                    current_event_string = self.event_string
 
-                    string_offset = line.find(draft_string)
+                # Check root first
+                if "CardPool" in data and "InternalEventName" in data:
+                    detected_event_name = data.get("InternalEventName")
+                    if (
+                        not current_event_string
+                        or detected_event_name == current_event_string
+                    ):
+                        pool.extend(data.get("CardPool", []))
+                else:
+                    course = data.get("Course", data.get("Courses", {}))
+                    if isinstance(course, list):
+                        for c in course:
+                            name = c.get("InternalEventName")
+                            if not current_event_string or name == current_event_string:
+                                detected_event_name = name
+                                pool.extend(c.get("CardPool", []))
+                                break
+                    elif isinstance(course, dict):
+                        name = course.get("InternalEventName")
+                        if not current_event_string or name == current_event_string:
+                            detected_event_name = name
+                            pool.extend(course.get("CardPool", []))
 
-                    if string_offset != -1:
-                        update = True
-                        self.pack_offset = offset
-                        start_offset = line.find("{\"CurrentModule\"")
-                        self.draft_log.info(line)
-                        # Identify the pack
-                        draft_data = json.loads(line[start_offset:])
-                        payload_data = json.loads(draft_data["Payload"])
-                        changes = payload_data["Changes"]
-                        try:
-                            card_pool = []
-                            for change in changes:
-                                if change["Source"] == "EventGrantCardPool":
-                                    card_list_data = change["GrantedCards"]
-                                    for card_data in card_list_data:
-                                        card = str(card_data["GrpId"])
-                                        card_pool.append(card)
-                            self.__sealed_update(card_pool)
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__sealed_pack_search Error: %s", error)
+                # RECOVERY: If we found a pool but didn't have an event registered, register it now
+                if pool and not current_event_string and detected_event_name:
+                    dummy_payload = {"EventName": detected_event_name}
+                    self.__check_event(dummy_payload)
 
-        except Exception as error:
-            self.draft_log.info("__sealed_pack_search Error: %s", error)
-        return update
-
-    def __sealed_pack_search_v2(self):
-        '''Parse sealed string that contains all of the card data'''
-        offset = self.pack_offset
-        draft_string = f'\"InternalEventName\":\"{self.event_string}\"'
-        update = False
-        # Identify and print out the log lines that contain the draft packs
-        try:
-            with open(self.arena_file, 'r', encoding="utf-8", errors="replace") as log:
-                log.seek(offset)
-
-                while True:
-                    line = log.readline()
-                    if not line:
-                        break
-                    offset = log.tell()
-
-                    #string_offset = line.find(draft_string)
-                    if (draft_string in line) and ("CardPool" in line):
-                        try:
-                            self.pack_offset = offset
-                            self.draft_log.info(line)
-                            start_offset = line.find("{\"Courses\"")
-                            course_data = json.loads(line[start_offset:])
-
-                            for course in course_data["Courses"]:
-                                if course["InternalEventName"] == self.event_string:
-                                    card_pool = [str(x) for x in course["CardPool"]]
-                                    self.__sealed_update(card_pool)
-
+                if pool:
+                    pool_strs = [str(x) for x in pool]
+                    with self.lock:
+                        if not self.taken_cards or sorted(self.taken_cards) != sorted(
+                            pool_strs
+                        ):
+                            self.taken_cards = pool_strs
+                            self._save_state()
                             update = True
-                        except Exception as error:
-                            self.draft_log.info(
-                                "__sealed_pack_search_v2 Error: %s", error)
-
-        except Exception as error:
-            self.draft_log.info("__sealed_pack_search_v2 Error: %s", error)
+            except Exception as e:
+                logger.error(f"Card Pool Search Error: {e}")
         return update
-        
-    def __sealed_update(self, cards):
-        
-        if not self.taken_cards:
-            self.taken_cards.extend(cards)
+
+    # =========================================================================
+    # DATA RETRIEVAL
+    # =========================================================================
 
     def retrieve_data_sources(self):
-        '''Return a list of set files that can be used with the current active draft'''
         data_sources = {}
-
         try:
+            file_list, error_list = retrieve_local_set_list()
             if self.draft_type != constants.LIMITED_TYPE_UNKNOWN:
-                draft_list = list(constants.LIMITED_TYPES_DICT.keys())
-                draft_type = [
-                    x for x in draft_list if constants.LIMITED_TYPES_DICT[x] == self.draft_type][0]
-                draft_list.insert(0, draft_list.pop(
-                    draft_list.index(draft_type)))
-
-                # Search for the set files
-                for draft_set in self.draft_sets:
-                    for draft_type in draft_list:
-                        file_name = "_".join(
-                            (draft_set, draft_type, constants.SET_FILE_SUFFIX))
-                        file = FE.search_local_files(
-                            [self.sets_location], [file_name])
-                        if file:
-                            result = FE.check_file_integrity(file[0])
-
-                            if result[0] == FE.Result.VALID:
-                                type_string = f"[{draft_set[0:3]}]{draft_type}" if re.findall(
-                                    r"^[Yy]\d{2}", draft_set) else draft_type
-                                data_sources[type_string] = file[0]
-
+                found_types = [
+                    k
+                    for k, v in constants.LIMITED_TYPES_DICT.items()
+                    if v == self.draft_type
+                ]
+                if file_list:
+                    file_list.sort(
+                        key=lambda x: (
+                            0 if x[1] in found_types else 1,
+                            datetime.strptime(x[4], "%Y-%m-%d"),
+                        ),
+                        reverse=True,
+                    )
+                    file_list.sort(key=lambda x: x[7], reverse=True)
+            for file in file_list:
+                set_code, event_type, user_group, location = (
+                    file[0],
+                    file[1],
+                    file[2],
+                    file[6],
+                )
+                prefix = (
+                    f"[{set_code[0:6]}]"
+                    if re.search(r"^[Yy]\d{2}", set_code)
+                    else f"[{set_code}]"
+                )
+                data_sources[f"{prefix} {event_type} ({user_group})"] = location
         except Exception as error:
             logger.error(error)
-
-        if not data_sources:
-            data_sources = constants.DATA_SOURCES_NONE
-
-        return data_sources
-
-    def retrieve_tier_source(self):
-        '''Return a list of tier files that can be used with the current active draft'''
-        tier_sources = []
-
-        try:
-            if self.draft_sets:
-                file = FE.search_local_files([constants.TIER_FOLDER], [
-                    constants.TIER_FILE_PREFIX])
-
-                if file:
-                    tier_sources = file
-
-        except Exception as error:
-            logger.error(error)
-
-        return tier_sources
+        return data_sources if data_sources else constants.DATA_SOURCES_NONE
 
     def retrieve_set_data(self, file):
-        '''Retrieve set data from the set data files'''
-        result = FE.Result.ERROR_MISSING_FILE
-        self.set_data = None
+        with self.lock:
+            self.set_data.clear()
+            result = self.set_data.open_file(file)
+            self._metrics_cache = SetMetrics(self.set_data)
+            return result
 
-        try:
-            result, json_data = FE.check_file_integrity(file)
+    def retrieve_set_metrics(self):
+        with self.lock:
+            if not hasattr(self, "_metrics_cache") or self._metrics_cache is None:
+                self._metrics_cache = SetMetrics(self.set_data)
+            return self._metrics_cache
 
-            if result == FE.Result.VALID:
-                self.set_data = json_data
-
-        except Exception as error:
-            logger.error(error)
-
-        return result
-
-    def retrieve_set_metrics(self, bayesian_enabled):
-        '''Parse set data and calculate the mean and standard deviation for a set'''
-        set_metrics = CL.SetMetrics()
-
-        try:
-            if self.set_data:
-                set_metrics.mean = CL.calculate_mean(
-                    self.set_data["card_ratings"], bayesian_enabled)
-                set_metrics.standard_deviation = CL.calculate_standard_deviation(
-                    self.set_data["card_ratings"], set_metrics.mean, bayesian_enabled)
-        except Exception as error:
-            logger.error(error)
-        return set_metrics
+    def retrieve_tier_data(self):
+        with self.lock:
+            event_set, _ = self.retrieve_current_limited_event()
+            data, _ = self.tier_list.retrieve_data(event_set)
+            return data
 
     def retrieve_color_win_rate(self, label_type):
-        '''Parse set data and return a list of color win rates'''
-        deck_colors = {}
-        for colors in constants.DECK_FILTERS:
-            deck_color = colors
-            if (label_type == constants.DECK_FILTER_FORMAT_NAMES) and (deck_color in constants.COLOR_NAMES_DICT):
-                deck_color = constants.COLOR_NAMES_DICT[deck_color]
-            deck_colors[colors] = deck_color
-
-        try:
-            if self.set_data:
-                for colors in self.set_data["color_ratings"]:
-                    for deck_color in deck_colors:
-                        if (len(deck_color) == len(colors)) and set(deck_color).issubset(colors):
-                            filter_label = deck_color
-                            if (label_type == constants.DECK_FILTER_FORMAT_NAMES) and (deck_color in constants.COLOR_NAMES_DICT):
-                                filter_label = constants.COLOR_NAMES_DICT[deck_color]
-                            ratings_string = filter_label + \
-                                f' ({self.set_data["color_ratings"][colors]}%)'
-                            deck_colors[deck_color] = ratings_string
-        except Exception as error:
-            logger.error(error)
-
-        # Switch key and value
-        deck_colors = {v: k for k, v in deck_colors.items()}
-
-        return deck_colors
+        with self.lock:
+            deck_colors = {}
+            try:
+                ratings = self.set_data.get_color_ratings()
+                for filter_key in constants.DECK_FILTERS:
+                    std_key = normalize_color_string(filter_key)
+                    display_label = std_key
+                    if (label_type == constants.DECK_FILTER_FORMAT_NAMES) and (
+                        std_key in constants.COLOR_NAMES_DICT
+                    ):
+                        display_label = constants.COLOR_NAMES_DICT[std_key]
+                    if filter_key in [
+                        constants.FILTER_OPTION_AUTO,
+                        constants.FILTER_OPTION_ALL_DECKS,
+                    ]:
+                        if std_key in ratings:
+                            display_label = f"{display_label} ({ratings[std_key]}%)"
+                        deck_colors[filter_key] = display_label
+                    elif std_key in ratings:
+                        deck_colors[filter_key] = (
+                            f"{display_label} ({ratings[std_key]}%)"
+                        )
+            except Exception as error:
+                logger.error(error)
+            return {v: k for k, v in deck_colors.items()}
 
     def retrieve_current_picked_cards(self):
-        '''Return the card data for the card that was picked from the current pack'''
-        pickeds_card = []
+        with self.lock:
+            if self.current_pick == 0:
+                return []
 
-        pack_index = max(self.current_pick - 1, 0) % 8
+            expected_players = (
+                4
+                if self.draft_type
+                in [
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+                ]
+                else 8
+            )
 
-        if pack_index < len(self.picked_cards):
-            for card in self.picked_cards[pack_index]:
-                try:
-                    pickeds_card.append(
-                        retrieve_card_data(self.set_data, card))
-                except Exception as error:
-                    logger.error(error)
-
-        return pickeds_card
+            pack_index = (self.current_pick - 1) % expected_players
+            if pack_index < len(self.picked_cards):
+                return self.set_data.get_data_by_id(self.picked_cards[pack_index])
+            return []
 
     def retrieve_current_missing_cards(self):
-        '''Retrieve a list of missing cards from the current pack'''
-        missing_cards = []
+        with self.lock:
+            try:
+                expected_players = (
+                    4
+                    if self.draft_type
+                    in [
+                        constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+                        constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+                        constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+                    ]
+                    else 8
+                )
 
-        try:
-            pack_index = max(self.current_pick - 1, 0) % 8
-
-            if pack_index < len(self.pack_cards):
-                # Retrieve the cards from the current pack
-                current_pack_cards = self.pack_cards[pack_index]
-
-            if pack_index < len(self.initial_pack):
-                # Retrieve the cards that were initially in the current pack
-                initial_pack_cards = self.initial_pack[pack_index]
-
-            # Identify the missing cards by removing the taken card and the current cards from the initial pack
-            card_list = [
-                x for x in initial_pack_cards if x not in current_pack_cards]
-            for card in card_list:
-                missing_cards.append(retrieve_card_data(self.set_data, card))
-        except Exception as error:
-            logger.error(error)
-
-        return missing_cards
+                pack_index = (self.current_pick - 1) % expected_players
+                if pack_index < len(self.pack_cards) and pack_index < len(
+                    self.initial_pack
+                ):
+                    card_list = [
+                        x
+                        for x in self.initial_pack[pack_index]
+                        if x not in self.pack_cards[pack_index]
+                    ]
+                    return self.set_data.get_data_by_id(card_list)
+            except Exception as error:
+                logger.error(error)
+            return []
 
     def retrieve_current_pack_cards(self):
-        '''Return the cards from the current pack'''
-        pack_cards = []
+        with self.lock:
+            if self.current_pick == 0:
+                return []
 
-        pack_index = max(self.current_pick - 1, 0) % 8
+            expected_players = (
+                4
+                if self.draft_type
+                in [
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+                    constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+                ]
+                else 8
+            )
 
-        if pack_index < len(self.pack_cards):
-            for card in self.pack_cards[pack_index]:
-                pack_cards.append(retrieve_card_data(self.set_data, card))
+            pack_index = (self.current_pick - 1) % expected_players
+            if pack_index < len(self.pack_cards):
+                # We return copies of the card dicts so the UI can mutate them (e.g. for display names)
+                raw_cards = self.set_data.get_data_by_id(self.pack_cards[pack_index])
+                pack_cards = []
 
-        return pack_cards
+                # WHEEL PREDICTION: Cross-reference initial_pack slots to see which cards might come back.
+                rotation_size = expected_players
+
+                returnable_picks_by_name = {}
+                for i, slot_ids in enumerate(self.initial_pack):
+                    if i == pack_index or not slot_ids:
+                        continue
+                    # A pack from slot i wheels back at pick (i+1) + rotation_size
+                    return_pick = (i + 1) + rotation_size
+                    if return_pick > self.current_pick:
+                        picked_from_slot = set(
+                            self.picked_cards[i] if i < len(self.picked_cards) else []
+                        )
+                        remaining_ids = [
+                            cid for cid in slot_ids if cid not in picked_from_slot
+                        ]
+                        for name in self.set_data.get_names_by_id(remaining_ids):
+                            returnable_picks_by_name.setdefault(name, []).append(
+                                return_pick
+                            )
+
+                for card in raw_cards:
+                    card_copy = dict(card)
+                    name = card.get(constants.DATA_FIELD_NAME, "")
+                    card_copy["returnable_at"] = sorted(
+                        returnable_picks_by_name.get(name, [])
+                    )
+                    pack_cards.append(card_copy)
+
+                return pack_cards
+            return []
+
+    @property
+    def cards_per_pick(self):
+        """Returns the number of cards taken per passing round (usually 1, or 2 for PickTwo)."""
+        if self.draft_type in [
+            constants.LIMITED_TYPE_DRAFT_PICK_TWO,
+            constants.LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+            constants.LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+        ]:
+            return 2
+        return 1
 
     def retrieve_taken_cards(self):
-        '''Return the card data for all of the cards that were picked during the draft'''
-        taken_cards = []
-
-        for card in self.taken_cards:
-            taken_cards.append(retrieve_card_data(self.set_data, card))
-        return taken_cards
-
-    def retrieve_tier_data(self, files):
-        '''Parse a tier list file and return the tier data'''
-        tier_data = {}
-        tier_options = {}
-        count = 0
-        try:
-            for file in files:
-                if os.path.exists(file):
-                    with open(file, 'r', encoding="utf-8", errors="replace") as json_file:
-                        data = json.loads(json_file.read())
-                        if [i for i in self.draft_sets if i in data["meta"]["set"]]:
-                            tier_id = f"TIER{count}"
-                            tier_label = data["meta"]["label"]
-                            tier_key = f'{tier_id}: {tier_label}'
-                            tier_options[tier_key] = tier_id
-                            if data["meta"]["version"] == 1:
-                                for card_name, card_rating in data["ratings"].items():
-                                    data["ratings"][card_name] = {
-                                        "comment": ""}
-                                    data["ratings"][card_name]["rating"] = CL.format_tier_results(card_rating,
-                                                                                                  constants.RESULT_FORMAT_RATING,
-                                                                                                  constants.RESULT_FORMAT_GRADE)
-                            elif data["meta"]["version"] == 2:
-                                for card_name, card_rating in data["ratings"].items():
-                                    data["ratings"][card_name] = {
-                                        "comment": ""}
-                                    data["ratings"][card_name]["rating"] = card_rating
-                            tier_data[tier_id] = data
-                            count += 1
-
-        except Exception as error:
-            logger.error(error)
-        return tier_data, tier_options
+        with self.lock:
+            return self.set_data.get_data_by_id(self.taken_cards)
 
     def retrieve_current_pack_and_pick(self):
-        '''Return the current pack and pick numbers (p1p1 is current_pack=1, current_pick=1)'''
-        return self.current_pack, self.current_pick
+        with self.lock:
+            return self.current_pack, self.current_pick
 
     def retrieve_current_limited_event(self):
-        '''Return the set code string and event type string'''
-        event_set = ""
-        event_type = ""
+        with self.lock:
+            return (self.draft_sets[0] if self.draft_sets else ""), self.draft_label
 
-        try:
-            event_set = self.draft_sets[0] if self.draft_sets else ""
+    def _record_pack(self, pack, pick, card_ids):
+        if (
+            self.draft_history
+            and self.draft_history[-1]["Pack"] == pack
+            and self.draft_history[-1]["Pick"] == pick
+        ):
+            return
+        if not self.draft_history or (
+            self.draft_history[-1]["Pack"] != pack
+            or self.draft_history[-1]["Pick"] != pick
+        ):
+            self.draft_history.append({"Pack": pack, "Pick": pick, "Cards": card_ids})
 
-            for key, value in constants.LIMITED_TYPES_DICT.items():
-                if value == self.draft_type:
-                    event_type = key
-                    break
-
-        except Exception as error:
-            logger.error(error)
-
-        return event_set, event_type
+    def retrieve_draft_history(self):
+        with self.lock:
+            return self.draft_history

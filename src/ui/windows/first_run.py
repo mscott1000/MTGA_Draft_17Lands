@@ -1,0 +1,113 @@
+"""
+src/ui/windows/first_run.py
+
+One-time nontechnical setup dialog for Arena integration and auto-launch.
+"""
+
+import tkinter
+from tkinter import ttk, messagebox
+
+from src.auto_launch import set_auto_launch_enabled
+from src.configuration import write_configuration
+from src.ui.styles import Theme
+
+
+class FirstRunSetupWindow(tkinter.Toplevel):
+    def __init__(self, parent, configuration, on_complete=None):
+        super().__init__(parent)
+        self.configuration = configuration
+        self.on_complete = on_complete
+
+        self.title("MTGA Draft Tool — First-Time Setup")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self._finish_without_auto_launch)
+
+        container = ttk.Frame(self, padding=Theme.scaled_val(24))
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(
+            container,
+            text="FIRST-TIME SETUP",
+            font=Theme.scaled_font(14, "bold"),
+        ).pack(anchor="w", pady=(0, Theme.scaled_val(12)))
+
+        ttk.Label(
+            container,
+            text=(
+                "1. In MTG Arena, open Options → Account.\n"
+                "2. Turn on Detailed Logs (Plugin Support).\n"
+                "3. Choose whether this assistant should open automatically with Arena."
+            ),
+            justify="left",
+            font=Theme.scaled_font(10),
+        ).pack(anchor="w", pady=(0, Theme.scaled_val(18)))
+
+        self.auto_var = tkinter.BooleanVar(value=True)
+        ttk.Checkbutton(
+            container,
+            text="Open Draft Assistant automatically with MTG Arena",
+            variable=self.auto_var,
+        ).pack(anchor="w", pady=(0, Theme.scaled_val(8)))
+
+        ttk.Label(
+            container,
+            text=(
+                "When enabled, the assistant waits quietly in the background and "
+                "shows itself when Arena starts. No administrator access is required."
+            ),
+            justify="left",
+            wraplength=Theme.scaled_val(440),
+            font=Theme.scaled_font(9),
+        ).pack(anchor="w", pady=(0, Theme.scaled_val(20)))
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill="x")
+        ttk.Button(
+            buttons, text="Not Now", command=self._finish_without_auto_launch
+        ).pack(side="left")
+        ttk.Button(
+            buttons, text="Finish Setup", command=self._finish
+        ).pack(side="right")
+
+        self.update_idletasks()
+        try:
+            x = parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2)
+            y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)
+            self.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        self.grab_set()
+        self.focus_force()
+
+    def _finish(self):
+        enabled = bool(self.auto_var.get())
+        ok, error = set_auto_launch_enabled(enabled)
+        if not ok:
+            messagebox.showerror(
+                "Automatic Startup Could Not Be Enabled",
+                "The Draft Assistant could not configure automatic startup.\n\n"
+                f"{error}\n\n"
+                "You can try again later in File → Preferences.",
+                parent=self,
+            )
+            enabled = False
+
+        self.configuration.settings.launch_with_arena = enabled
+        self.configuration.settings.first_run_complete = True
+        write_configuration(self.configuration)
+        self.destroy()
+
+        if self.on_complete:
+            self.on_complete(enabled)
+
+    def _finish_without_auto_launch(self):
+        self.configuration.settings.launch_with_arena = False
+        self.configuration.settings.first_run_complete = True
+        set_auto_launch_enabled(False)
+        write_configuration(self.configuration)
+        self.destroy()
+
+        if self.on_complete:
+            self.on_complete(False)

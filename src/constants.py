@@ -1,10 +1,57 @@
+import glob
 import os
+import sys
 import getpass
+
+
+def get_base_dir():
+    if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            path = os.path.expanduser("~/Library/Application Support/MTGA_Draft_Tool")
+        elif sys.platform == "linux":
+            path = os.path.expanduser("~/.config/MTGA_Draft_Tool")
+        else:
+            path = os.path.dirname(sys.executable)
+    else:
+        path = os.getcwd()
+
+    if not os.path.exists(path):
+        try:
+            os.makedirs(path)
+        except Exception:
+            pass
+    return path
+
+
+def get_resource_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.getcwd())
+    return os.getcwd()
+
+
+BASE_DIR = get_base_dir()
+RESOURCE_DIR = get_resource_dir()
+
+APPLICATION_VERSION = "4.20"
+OLD_APPLICATION_VERSION = "4.19"
+PREVIOUS_APPLICATION_VERSION = "0419"
 
 FONT_SANS_SERIF = "Arial"
 FONT_MONO_SPACE = "Courier"
 
-BASIC_LANDS = ["Island", "Mountain", "Swamp", "Plains", "Forest"]
+BASIC_LANDS = [
+    "Island",
+    "Mountain",
+    "Swamp",
+    "Plains",
+    "Forest",
+    "Snow-Covered Island",
+    "Snow-Covered Mountain",
+    "Snow-Covered Swamp",
+    "Snow-Covered Plains",
+    "Snow-Covered Forest",
+    "Wastes",
+]
 
 CARD_COLOR_SYMBOL_WHITE = "W"
 CARD_COLOR_SYMBOL_BLACK = "B"
@@ -15,10 +62,10 @@ CARD_COLOR_SYMBOL_NONE = "NC"
 
 CARD_COLORS = [
     CARD_COLOR_SYMBOL_WHITE,
-    CARD_COLOR_SYMBOL_BLACK,
     CARD_COLOR_SYMBOL_BLUE,
+    CARD_COLOR_SYMBOL_BLACK,
     CARD_COLOR_SYMBOL_RED,
-    CARD_COLOR_SYMBOL_GREEN
+    CARD_COLOR_SYMBOL_GREEN,
 ]
 
 CARD_COLOR_LABEL_WHITE = "White"
@@ -28,6 +75,8 @@ CARD_COLOR_LABEL_RED = "Red"
 CARD_COLOR_LABEL_GREEN = "Green"
 CARD_COLOR_LABEL_NC = "NC"
 
+COLOR_WIN_RATE_GAME_COUNT_THRESHOLD_DEFAULT = 500
+
 LIMITED_TYPE_UNKNOWN = 0
 LIMITED_TYPE_DRAFT_PREMIER_V1 = 1
 LIMITED_TYPE_DRAFT_PREMIER_V2 = 2
@@ -35,10 +84,10 @@ LIMITED_TYPE_DRAFT_QUICK = 3
 LIMITED_TYPE_DRAFT_TRADITIONAL = 4
 LIMITED_TYPE_SEALED = 5
 LIMITED_TYPE_SEALED_TRADITIONAL = 6
-
-URL_17LANDS = "https://www.17lands.com"
-
-IMAGE_17LANDS_SITE_PREFIX = "/static/images/"
+LIMITED_TYPE_DRAFT_PICK_TWO = 7
+LIMITED_TYPE_DRAFT_PICK_TWO_TRAD = 8
+LIMITED_TYPE_DRAFT_PICK_TWO_QUICK = 9
+LIMITED_TYPE_DRAFT_CONTENDER = 10
 
 DATA_FIELD_17LANDS_OHWR = "opening_hand_win_rate"
 DATA_FIELD_17LANDS_NGOH = "opening_hand_game_count"
@@ -55,7 +104,6 @@ DATA_FIELD_17LANDS_GDWR = "drawn_win_rate"
 DATA_FIELD_17LANDS_NGD = "drawn_game_count"
 DATA_FIELD_17LANDS_IMAGE = "url"
 DATA_FIELD_17LANDS_IMAGE_BACK = "url_back"
-
 
 DATA_FIELD_GIHWR = "gihwr"
 DATA_FIELD_OHWR = "ohwr"
@@ -85,32 +133,36 @@ DATA_FIELD_DISABLED = "disabled"
 DATA_FIELD_RARITY = "rarity"
 DATA_FIELD_MANA_COST = "mana_cost"
 
-DATA_FIELDS_LIST = [DATA_FIELD_GIHWR,
-                    DATA_FIELD_OHWR,
-                    DATA_FIELD_GPWR,
-                    DATA_FIELD_GNSWR,
-                    DATA_FIELD_ALSA,
-                    DATA_FIELD_ATA,
-                    DATA_FIELD_IWD,
-                    DATA_FIELD_NGP,
-                    DATA_FIELD_NGOH,
-                    DATA_FIELD_GIH,
-                    DATA_FIELD_NGND,
-                    DATA_FIELD_GDWR,
-                    DATA_FIELD_NGD]
+DATA_FIELDS_LIST = [
+    DATA_FIELD_GIHWR,
+    DATA_FIELD_OHWR,
+    DATA_FIELD_GPWR,
+    DATA_FIELD_GNSWR,
+    DATA_FIELD_ALSA,
+    DATA_FIELD_ATA,
+    DATA_FIELD_IWD,
+    DATA_FIELD_NGP,
+    DATA_FIELD_NGOH,
+    DATA_FIELD_GIH,
+    DATA_FIELD_NGND,
+    DATA_FIELD_GDWR,
+    DATA_FIELD_NGD,
+]
 
-DATA_SET_FIELDS = [DATA_FIELD_GIHWR,
-                   DATA_FIELD_OHWR,
-                   DATA_FIELD_GPWR,
-                   DATA_FIELD_ALSA,
-                   DATA_FIELD_IWD,
-                   DATA_FIELD_CMC,
-                   DATA_FIELD_COLORS,
-                   DATA_FIELD_NAME,
-                   DATA_FIELD_TYPES,
-                   DATA_FIELD_MANA_COST,
-                   DATA_SECTION_IMAGES,
-                   DATA_FIELD_DECK_COLORS]
+DATA_SET_FIELDS = [
+    DATA_FIELD_GIHWR,
+    DATA_FIELD_OHWR,
+    DATA_FIELD_GPWR,
+    DATA_FIELD_ALSA,
+    DATA_FIELD_IWD,
+    DATA_FIELD_CMC,
+    DATA_FIELD_COLORS,
+    DATA_FIELD_NAME,
+    DATA_FIELD_TYPES,
+    DATA_FIELD_MANA_COST,
+    DATA_SECTION_IMAGES,
+    DATA_FIELD_DECK_COLORS,
+]
 
 FILTER_OPTION_ALL_DECKS = "All Decks"
 FILTER_OPTION_AUTO = "Auto"
@@ -131,39 +183,56 @@ FIELD_LABEL_GDWR = "GDWR: Games Drawn Win Rate"
 
 DATA_SET_VERSION_3 = 3.0
 
-WIN_RATE_OPTIONS = [DATA_FIELD_GIHWR, DATA_FIELD_OHWR,
-                    DATA_FIELD_GPWR, DATA_FIELD_GNSWR, DATA_FIELD_GDWR]
-NON_COLORS_OPTIONS = WIN_RATE_OPTIONS + \
-    [DATA_FIELD_IWD, DATA_FIELD_ALSA, DATA_FIELD_ATA]
-DECK_COLORS = [FILTER_OPTION_ALL_DECKS, CARD_COLOR_SYMBOL_WHITE, CARD_COLOR_SYMBOL_BLUE, CARD_COLOR_SYMBOL_BLACK, CARD_COLOR_SYMBOL_RED,
-               CARD_COLOR_SYMBOL_GREEN, "WU", "WB", "WR", "WG", "UB", "UR", "UG", "BR", "BG", "RG", "WUB", "WUR", "WUG", "WBR", "WBG", "WRG", "UBR", "UBG", "URG", "BRG"]
-COLUMN_OPTIONS = NON_COLORS_OPTIONS
-DECK_FILTERS = [FILTER_OPTION_AUTO] + DECK_COLORS
+START_DATE_DEFAULT = "2019-01-01"
 
-COLUMN_2_DEFAULT = FIELD_LABEL_GIHWR
-COLUMN_3_DEFAULT = FIELD_LABEL_DISABLED
-COLUMN_4_DEFAULT = FIELD_LABEL_DISABLED
-COLUMN_5_DEFAULT = FIELD_LABEL_DISABLED
-COLUMN_6_DEFAULT = FIELD_LABEL_DISABLED
-COLUMN_7_DEFAULT = FIELD_LABEL_DISABLED
+WIN_RATE_OPTIONS = [
+    DATA_FIELD_GIHWR,
+    DATA_FIELD_OHWR,
+    DATA_FIELD_GPWR,
+    DATA_FIELD_GNSWR,
+    DATA_FIELD_GDWR,
+]
+NON_COLORS_OPTIONS = WIN_RATE_OPTIONS + [
+    DATA_FIELD_IWD,
+    DATA_FIELD_ALSA,
+    DATA_FIELD_ATA,
+]
+COLUMN_OPTIONS = NON_COLORS_OPTIONS
+
+COLUMN_FIELD_LABELS = {
+    "gihwr": "GIH WR: Games in Hand Win Rate",
+    "ohwr": "OH WR: Opening Hand Win Rate",
+    "gpwr": "GP WR: Games Played Win Rate",
+    "alsa": "ALSA: Average Last Seen At",
+    "ata": "ATA: Average Taken At",
+    "iwd": "IWD: Improvement When Drawn",
+    "wheel": "WHEEL: Probability of Wheeling",
+    "colors": "COLORS: Card Colors",
+    "count": "COUNT: Total Card Count",
+    "value": "VALUE: Advisor Tactical Score",
+    "tags": "TAGS: Card Roles",
+}
+LABEL_TO_COLUMN_FIELD = {v: k for k, v in COLUMN_FIELD_LABELS.items()}
 
 DECK_FILTER_DEFAULT = FILTER_OPTION_AUTO
 
 UI_SIZE_DEFAULT = "100%"
 
 DRAFT_LOG_PREFIX = "DraftLog_"
-DRAFT_LOG_FOLDER = os.path.join(os.getcwd(), "Logs")
-
-TIER_FOLDER = os.path.join(os.getcwd(), "Tier")
-TIER_FILE_PREFIX = "Tier_"
+DRAFT_LOG_FOLDER = os.path.join(BASE_DIR, "Logs")
 
 DRAFT_DETECTION_CATCH_ALL = ["Draft", "draft"]
 
-DRAFT_START_STRING_EVENT_JOIN = "[UnityCrossThreadLogger]==> Event_Join "
-DRAFT_START_STRING_BOT_DRAFT = "[UnityCrossThreadLogger]==> BotDraft_DraftStatus "
+DRAFT_START_STRING_PREMIER = "[UnityCrossThreadLogger]==> Event_Join "
+DRAFT_PICK_STRING_PREMIER = "[UnityCrossThreadLogger]==> Event_PlayerDraftMakePick "
+DRAFT_PICK_STRING_PREMIER_OLD = "[UnityCrossThreadLogger]==> Draft.MakeHumanDraftPick "
+DRAFT_PACK_STRING_PREMIER = "[UnityCrossThreadLogger]Draft.Notify "
 
-DRAFT_START_STRINGS = [DRAFT_START_STRING_EVENT_JOIN,
-                       DRAFT_START_STRING_BOT_DRAFT]
+DRAFT_START_STRING_QUICK_DRAFT = "[UnityCrossThreadLogger]==> BotDraft_DraftStatus "
+DRAFT_PACK_STRING_QUICK = "DraftPack"
+DRAFT_PICK_STRING_QUICK = "[UnityCrossThreadLogger]==> BotDraft_DraftPick "
+
+DRAFT_START_STRINGS = [DRAFT_START_STRING_PREMIER, DRAFT_START_STRING_QUICK_DRAFT]
 
 DATA_SOURCES_NONE = {"None": ""}
 
@@ -177,36 +246,100 @@ RESULT_FORMAT_WIN_RATE = "Percentage"
 RESULT_FORMAT_RATING = "Rating"
 RESULT_FORMAT_GRADE = "Grade"
 
-RESULT_FORMAT_LIST = [RESULT_FORMAT_WIN_RATE,
-                      RESULT_FORMAT_RATING, RESULT_FORMAT_GRADE]
+RESULT_FORMAT_LIST = [RESULT_FORMAT_WIN_RATE, RESULT_FORMAT_RATING, RESULT_FORMAT_GRADE]
+
+RESULT_UNKNOWN_STRING = " "
+RESULT_UNKNOWN_VALUE = 0.0
 
 LOCAL_DATA_FOLDER_PATH_WINDOWS = os.path.join(
-    "Wizards of the Coast", "MTGA", "MTGA_Data")
+    "Wizards of the Coast", "MTGA", "MTGA_Data"
+)
+LOCAL_DATA_FOLDER_PATH_WINDOWS_STEAM = os.path.join(
+    "Steam", "steamapps", "common", "MTGA", "MTGA_Data"
+)
 LOCAL_DATA_FOLDER_PATH_OSX = os.path.join(
-    "Library", "Application Support", "com.wizards.mtga")
-LOCAL_DATA_FOLDER_PATH_LINUX = next(filter(os.path.exists, [
-    # Steam
-    os.path.join(os.path.expanduser("~"), ".local", "share", "Steam", "steamapps", "common", "MTGA", "MTGA_Data"),
+    "Library", "Application Support", "com.wizards.mtga"
+)
+LOCAL_DATA_FOLDER_PATH_OSX_STEAM = os.path.join(
+    "Library",
+    "Application Support",
+    "Steam",
+    "steamapps",
+    "common",
+    "MTGA",
+    "MTGA_Data",
+)
+# --- Linux install discovery -------------------------------------------------
+# Flatpak Steam is the default on Fedora/Nobara/Bazzite, and Lutris, Bottles,
+# snap and secondary Steam libraries are all common. These lists are the single
+# source of truth for what counts as an Arena install location on Linux; both
+# the Player.log search (file_extractor.search_arena_log_locations) and the
+# card-database search (LOCAL_DATA_FOLDER_PATH_LINUX below) are built from them.
 
-    # Lutris
-    os.path.join(os.path.expanduser("~"), "Games", "magic-the-gathering-arena", "drive_c", "Program Files", "Wizards of the Coast", "MTGA", "MTGA_Data"),
+MTGA_STEAM_APPID = "2141910"
 
-    # Bottles
-    os.path.join(os.path.expanduser("~"), ".var", "app", "com.usebottles.bottles", "data", "bottles", "bottles", "MTG-Arena", "drive_c", "Program Files", "Wizards of the Coast", "MTGA", "MTGA_Data")
-    ]), None)
+# Steam roots, relative to the home directory.
+STEAM_ROOTS_LINUX = [
+    os.path.join(".local", "share", "Steam"),
+    os.path.join(".steam", "steam"),
+    os.path.join(".steam", "root"),
+    os.path.join(".steam", "debian-installation"),
+    os.path.join(".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam"),
+    os.path.join("snap", "steam", "common", ".local", "share", "Steam"),
+]
+
+# Non-Steam Wine prefixes, relative to the home directory. Entries are glob
+# patterns: Lutris names the prefix after the install-source slug and Bottles
+# after the user-chosen bottle name, so those components are wildcards. The
+# user directory inside these prefixes is the real login name rather than
+# "steamuser", so callers also glob over drive_c/users/*.
+WINE_PREFIXES_LINUX = [
+    ".wine",
+    os.path.join("Games", "*"),  # Lutris
+    os.path.join(
+        ".var", "app", "com.usebottles.bottles", "data", "bottles", "bottles", "*"
+    ),  # Bottles
+]
+
+_STEAM_MTGA_DATA_TAIL = os.path.join("steamapps", "common", "MTGA", "MTGA_Data")
+_WINE_MTGA_DATA_TAIL = os.path.join(
+    "drive_c", "Program Files", "Wizards of the Coast", "MTGA", "MTGA_Data"
+)
+
+LOCAL_DATA_FOLDER_PATH_LINUX = next(
+    (
+        path
+        for pattern in (
+            [
+                os.path.join(
+                    glob.escape(os.path.expanduser("~")), root, _STEAM_MTGA_DATA_TAIL
+                )
+                for root in STEAM_ROOTS_LINUX
+            ]
+            + [
+                os.path.join(
+                    glob.escape(os.path.expanduser("~")), prefix, _WINE_MTGA_DATA_TAIL
+                )
+                for prefix in WINE_PREFIXES_LINUX
+            ]
+        )
+        for path in sorted(glob.glob(pattern))
+    ),
+    None,
+)
 
 LOCAL_DOWNLOADS_DATA = os.path.join("Downloads", "Raw")
 
 LOCAL_DATA_FILE_PREFIX_CARDS = "Raw_cards_"
 LOCAL_DATA_FILE_PREFIX_DATABASE = "Raw_CardDatabase_"
 
-LOCAL_DATABASE_TABLE_LOCALIZATION = "Localizations"
+LOCAL_DATABASE_TABLE_LOCALIZATION = "Localizations_enUS"
 LOCAL_DATABASE_TABLE_ENUMERATOR = "Enums"
 LOCAL_DATABASE_TABLE_CARDS = "Cards"
 
 LOCAL_DATABASE_LOCALIZATION_COLUMN_ID = "LocId"
 LOCAL_DATABASE_LOCALIZATION_COLUMN_FORMAT = "Formatted"
-LOCAL_DATABASE_LOCALIZATION_COLUMN_TEXT = "enUS"
+LOCAL_DATABASE_LOCALIZATION_COLUMN_TEXT = "Loc"
 
 LOCAL_DATABASE_ENUMERATOR_COLUMN_ID = "LocId"
 LOCAL_DATABASE_ENUMERATOR_COLUMN_TYPE = "Type"
@@ -235,7 +368,8 @@ LOCAL_DATABASE_ENUMERATOR_QUERY = f"""SELECT
                                       FROM {LOCAL_DATABASE_TABLE_ENUMERATOR}
                                       WHERE {LOCAL_DATABASE_ENUMERATOR_COLUMN_TYPE} 
                                       IN ('{LOCAL_DATABASE_ENUMERATOR_TYPE_COLOR}', 
-                                          '{LOCAL_DATABASE_ENUMERATOR_TYPE_CARD_TYPES}')"""
+                                          '{LOCAL_DATABASE_ENUMERATOR_TYPE_CARD_TYPES}', 
+                                          'SubType')"""
 
 LOCAL_DATABASE_CARDS_QUERY = f"SELECT * FROM {LOCAL_DATABASE_TABLE_CARDS}"
 
@@ -253,15 +387,13 @@ LOCAL_CARDS_KEY_CASTING_COST = "oldschoolmanatext"
 LOCAL_CARDS_KEY_RARITY = "rarity"
 LOCAL_CARDS_KEY_PRIMARY = "isprimarycard"
 
-SETS_FOLDER = os.path.join(os.getcwd(), "Sets")
+SETS_FOLDER = os.path.join(BASE_DIR, "Sets")
 SET_FILE_SUFFIX = "Data.json"
-
-CARD_RATINGS_BACKOFF_DELAY_SECONDS = 30
-CARD_RATINGS_INTER_DELAY_SECONDS = 1
-CARD_RATINGS_ATTEMPT_MAX = 5
 
 SCRYFALL_REQUEST_BACKOFF_DELAY_SECONDS = 5
 SCRYFALL_REQUEST_ATTEMPT_MAX = 5
+
+DATASET_DOWNLOAD_RATE_LIMIT_SEC = 60
 
 PLATFORM_ID_OSX = "darwin"
 PLATFORM_ID_WINDOWS = "win32"
@@ -269,10 +401,25 @@ PLATFORM_ID_LINUX = "linux"
 
 LOG_NAME = "Player.log"
 
-LOG_LOCATION_WINDOWS = os.path.join('Users', getpass.getuser(
-), "AppData", "LocalLow", "Wizards Of The Coast", "MTGA", LOG_NAME)
+LOG_LOCATION_WINDOWS = os.path.join(
+    "Users",
+    getpass.getuser(),
+    "AppData",
+    "LocalLow",
+    "Wizards Of The Coast",
+    "MTGA",
+    LOG_NAME,
+)
 LOG_LOCATION_OSX = os.path.join(
-    "Library", "Logs", "Wizards of the Coast", "MTGA", LOG_NAME)
+    "Library", "Logs", "Wizards of the Coast", "MTGA", LOG_NAME
+)
+
+# Tail of the path once inside a Wine/Proton prefix user directory. Combined
+# with STEAM_ROOTS_LINUX / WINE_PREFIXES_LINUX (defined above with the card-DB
+# constants) by file_extractor.linux_arena_log_locations().
+LOG_LOCATION_APPDATA_SUFFIX = os.path.join(
+    "AppData", "LocalLow", "Wizards Of The Coast", "MTGA", LOG_NAME
+)
 
 DEFAULT_GIHWR_AVERAGE = 0.0
 
@@ -285,13 +432,64 @@ LIMITED_TYPE_STRING_DRAFT_BOT = "BotDraft"
 LIMITED_TYPE_STRING_DRAFT_TRAD = "TradDraft"
 LIMITED_TYPE_STRING_SEALED = "Sealed"
 LIMITED_TYPE_STRING_TRAD_SEALED = "TradSealed"
+LIMITED_TYPE_STRING_DRAFT_PICK_TWO = "PickTwoDraft"
+LIMITED_TYPE_STRING_DRAFT_PICK_TWO_TRAD = "PickTwoTradDraft"
+LIMITED_TYPE_STRING_DRAFT_PICK_TWO_QUICK = "PickTwoQuickDraft"
+LIMITED_TYPE_STRING_DRAFT_CONTENDER = "ContenderDraft"
 
 LIMITED_TYPE_LIST = [
     LIMITED_TYPE_STRING_DRAFT_PREMIER,
     LIMITED_TYPE_STRING_DRAFT_QUICK,
     LIMITED_TYPE_STRING_DRAFT_TRAD,
     LIMITED_TYPE_STRING_SEALED,
-    LIMITED_TYPE_STRING_TRAD_SEALED]
+    LIMITED_TYPE_STRING_TRAD_SEALED,
+    LIMITED_TYPE_STRING_DRAFT_PICK_TWO,
+    LIMITED_TYPE_STRING_DRAFT_PICK_TWO_TRAD,
+    LIMITED_TYPE_STRING_DRAFT_CONTENDER,
+]
+
+LIMITED_USER_GROUP_ALL = "All"
+LIMITED_USER_GROUP_BOTTOM = "Bottom"
+LIMITED_USER_GROUP_MIDDLE = "Middle"
+LIMITED_USER_GROUP_TOP = "Top"
+
+LIMITED_GROUPS_LIST = [
+    LIMITED_USER_GROUP_ALL,
+    LIMITED_USER_GROUP_TOP,
+    LIMITED_USER_GROUP_MIDDLE,
+    LIMITED_USER_GROUP_BOTTOM,
+]
+
+# 17Lands replaced custom start_date/end_date ranges with these preset
+# "time_period" values (the drop-down on the card pages). Maps the UI label to
+# the query value the endpoint expects; confirm against the browser Network tab
+# if a preset ever stops returning data.
+TIME_PERIOD_OPTIONS = {
+    "All Time": "ALL_TIME",
+    "Latest Event": "LATEST_EVENT",
+    "Last Two Weeks": "LAST_TWO_WEEKS",
+    "Last Week": "LAST_WEEK",
+    "Last Day": "LAST_DAY",
+    "First Week": "FIRST_WEEK",
+    "All Except First Week": "ALL_EXCEPT_FIRST_WEEK",
+}
+TIME_PERIOD_LABELS = list(TIME_PERIOD_OPTIONS.keys())
+TIME_PERIOD_DEFAULT_LABEL = "All Time"
+TIME_PERIOD_DEFAULT = "ALL_TIME"
+
+
+def time_period_value(label: str) -> str:
+    """UI label -> 17Lands query value, falling back to All Time."""
+    return TIME_PERIOD_OPTIONS.get(label, TIME_PERIOD_DEFAULT)
+
+
+def time_period_label(value: str) -> str:
+    """17Lands query value -> UI label, falling back to All Time."""
+    for lbl, val in TIME_PERIOD_OPTIONS.items():
+        if val == value:
+            return lbl
+    return TIME_PERIOD_DEFAULT_LABEL
+
 
 SET_TYPE_EXPANSION = "expansion"
 SET_TYPE_ALCHEMY = "alchemy"
@@ -308,8 +506,6 @@ SET_LIST_FIELDS = [SET_LIST_ARENA, SET_LIST_SCRYFALL, SET_LIST_17LANDS]
 
 SET_START_DATE = "start_date"
 
-SET_START_DATE_DEFAULT = "2019-1-1"
-
 SET_SELECTION_ALL = "ALL"
 SET_SELECTION_CUBE = "CUBE"
 
@@ -318,12 +514,17 @@ SET_LIST_COUNT_MAX = 50
 
 SET_ARENA_CUBE_START_OFFSET_DAYS = -25
 
-SUPPORTED_SET_TYPES = [SET_TYPE_EXPANSION, SET_TYPE_ALCHEMY,
-                       SET_TYPE_MASTERS, SET_TYPE_CORE, SET_TYPE_DRAFT_INNOVATION]
+SUPPORTED_SET_TYPES = [
+    SET_TYPE_EXPANSION,
+    SET_TYPE_ALCHEMY,
+    SET_TYPE_MASTERS,
+    SET_TYPE_CORE,
+    SET_TYPE_DRAFT_INNOVATION,
+]
 
 TABLE_STYLE = "Treeview"
 
-TEMP_FOLDER = os.path.join(os.getcwd(), "Temp")
+TEMP_FOLDER = os.path.join(BASE_DIR, "Temp")
 TEMP_LOCALIZATION_FILE = os.path.join(TEMP_FOLDER, "temp_localization.json")
 TEMP_CARD_DATA_FILE = os.path.join(TEMP_FOLDER, "temp_card_data.json")
 
@@ -350,7 +551,7 @@ LETTER_GRADE_D_PLUS = "D+"
 LETTER_GRADE_D = "D "
 LETTER_GRADE_D_MINUS = "D-"
 LETTER_GRADE_F = "F "
-LETTER_GRADE_NA = "NA"
+LETTER_GRADE_NA = " "
 LETTER_GRADE_SB = "SB"
 
 CARD_TYPE_CREATURE = "Creature"
@@ -382,12 +583,16 @@ CARD_RARITY_MYTHIC = "mythic"
 # Dictionaries
 # Used to identify the limited type based on log string
 LIMITED_TYPES_DICT = {
-    LIMITED_TYPE_STRING_DRAFT_PREMIER: LIMITED_TYPE_DRAFT_PREMIER_V1,
+    LIMITED_TYPE_STRING_DRAFT_PREMIER: LIMITED_TYPE_DRAFT_PREMIER_V2,  # UPDATED to V2
     LIMITED_TYPE_STRING_DRAFT_QUICK: LIMITED_TYPE_DRAFT_QUICK,
     LIMITED_TYPE_STRING_DRAFT_TRAD: LIMITED_TYPE_DRAFT_TRADITIONAL,
     LIMITED_TYPE_STRING_DRAFT_BOT: LIMITED_TYPE_DRAFT_QUICK,
     LIMITED_TYPE_STRING_SEALED: LIMITED_TYPE_SEALED,
     LIMITED_TYPE_STRING_TRAD_SEALED: LIMITED_TYPE_SEALED_TRADITIONAL,
+    LIMITED_TYPE_STRING_DRAFT_PICK_TWO: LIMITED_TYPE_DRAFT_PICK_TWO,
+    LIMITED_TYPE_STRING_DRAFT_PICK_TWO_TRAD: LIMITED_TYPE_DRAFT_PICK_TWO_TRAD,
+    LIMITED_TYPE_STRING_DRAFT_PICK_TWO_QUICK: LIMITED_TYPE_DRAFT_PICK_TWO_QUICK,
+    LIMITED_TYPE_STRING_DRAFT_CONTENDER: LIMITED_TYPE_DRAFT_CONTENDER,
 }
 
 COLOR_NAMES_DICT = {
@@ -416,7 +621,15 @@ COLOR_NAMES_DICT = {
     "BRG": "Jund",
     "WRG": "Naya",
     "WUG": "Bant",
+    "WUBR": "Not-Green",
+    "UBRG": "Not-White",
+    "WBRG": "Not-Blue",
+    "WURG": "Not-Black",
+    "WUBG": "Not-Red",
+    "WUBRG": "Five-Color",
 }
+DECK_COLORS = [FILTER_OPTION_ALL_DECKS] + [k for k in COLOR_NAMES_DICT.keys()]
+DECK_FILTERS = [FILTER_OPTION_AUTO] + DECK_COLORS
 
 CARD_COLORS_DICT = {
     CARD_COLOR_LABEL_WHITE: CARD_COLOR_SYMBOL_WHITE,
@@ -454,8 +667,7 @@ DATA_FIELD_17LANDS_DICT = {
     DATA_FIELD_NGND: DATA_FIELD_17LANDS_NGND,
     DATA_FIELD_GDWR: DATA_FIELD_17LANDS_GDWR,
     DATA_FIELD_NGD: DATA_FIELD_17LANDS_NGD,
-    DATA_SECTION_IMAGES: [DATA_FIELD_17LANDS_IMAGE,
-                          DATA_FIELD_17LANDS_IMAGE_BACK]
+    DATA_SECTION_IMAGES: [DATA_FIELD_17LANDS_IMAGE, DATA_FIELD_17LANDS_IMAGE_BACK],
 }
 
 COLUMNS_OPTIONS_MAIN_DICT = {
@@ -467,6 +679,7 @@ COLUMNS_OPTIONS_MAIN_DICT = {
     FIELD_LABEL_GIHWR: DATA_FIELD_GIHWR,
     FIELD_LABEL_GDWR: DATA_FIELD_GDWR,
     FIELD_LABEL_GNSWR: DATA_FIELD_GNSWR,
+    FIELD_LABEL_WHEEL: DATA_FIELD_WHEEL,
     FIELD_LABEL_COLORS: DATA_FIELD_COLORS,
 }
 
@@ -480,17 +693,20 @@ COLUMNS_OPTIONS_EXTRA_DICT = {
     FIELD_LABEL_GIHWR: DATA_FIELD_GIHWR,
     FIELD_LABEL_GDWR: DATA_FIELD_GDWR,
     FIELD_LABEL_GNSWR: DATA_FIELD_GNSWR,
+    FIELD_LABEL_WHEEL: DATA_FIELD_WHEEL,
     FIELD_LABEL_COLORS: DATA_FIELD_COLORS,
 }
 
-STATS_HEADER_CONFIG = {"Colors": {"width": .19, "anchor": "w"},
-                       "1": {"width": .11, "anchor": "c"},
-                       "2": {"width": .11, "anchor": "c"},
-                       "3": {"width": .11, "anchor": "c"},
-                       "4": {"width": .11, "anchor": "c"},
-                       "5": {"width": .11, "anchor": "c"},
-                       "6+": {"width": .11, "anchor": "c"},
-                       "Total": {"width": .15, "anchor": "c"}}
+STATS_HEADER_CONFIG = {
+    "Colors": {"width": 0.19, "anchor": "w"},
+    "1": {"width": 0.11, "anchor": "c"},
+    "2": {"width": 0.11, "anchor": "c"},
+    "3": {"width": 0.11, "anchor": "c"},
+    "4": {"width": 0.11, "anchor": "c"},
+    "5": {"width": 0.11, "anchor": "c"},
+    "6+": {"width": 0.11, "anchor": "c"},
+    "Total": {"width": 0.15, "anchor": "c"},
+}
 
 ROW_TAGS_BW_DICT = {
     BW_ROW_COLOR_ODD_TAG: (FONT_SANS_SERIF, "#3d3d3d", "#e6ecec"),
@@ -522,7 +738,7 @@ GRADE_ORDER_DICT = {
     LETTER_GRADE_D_MINUS: 3,
     LETTER_GRADE_F: 2,
     LETTER_GRADE_SB: 1,
-    LETTER_GRADE_NA: 0
+    LETTER_GRADE_NA: 0,
 }
 
 TIER_CONVERSION_RATINGS_GRADES_DICT = {
@@ -538,7 +754,7 @@ TIER_CONVERSION_RATINGS_GRADES_DICT = {
     LETTER_GRADE_D_PLUS: 1.5,
     LETTER_GRADE_D: 1.2,
     LETTER_GRADE_D_MINUS: 0.8,
-    LETTER_GRADE_F: 0.4
+    LETTER_GRADE_F: 0.4,
 }
 
 GRADE_DEVIATION_DICT = {
@@ -553,23 +769,51 @@ GRADE_DEVIATION_DICT = {
     LETTER_GRADE_C_MINUS: -0.67,
     LETTER_GRADE_D_PLUS: -1.00,
     LETTER_GRADE_D: -1.33,
-    LETTER_GRADE_D_MINUS: -1.67
+    LETTER_GRADE_D_MINUS: -1.67,
 }
 
 CARD_TYPE_DICT = {
-    CARD_TYPE_SELECTION_ALL: ([CARD_TYPE_CREATURE, CARD_TYPE_PLANESWALKER, CARD_TYPE_INSTANT, CARD_TYPE_SORCERY, CARD_TYPE_ENCHANTMENT, CARD_TYPE_ARTIFACT, CARD_TYPE_LAND], True, False, True),
+    CARD_TYPE_SELECTION_ALL: (
+        [
+            CARD_TYPE_CREATURE,
+            CARD_TYPE_PLANESWALKER,
+            CARD_TYPE_INSTANT,
+            CARD_TYPE_SORCERY,
+            CARD_TYPE_ENCHANTMENT,
+            CARD_TYPE_ARTIFACT,
+            CARD_TYPE_LAND,
+        ],
+        True,
+        False,
+        True,
+    ),
     CARD_TYPE_SELECTION_CREATURES: ([CARD_TYPE_CREATURE], True, False, True),
     CARD_TYPE_SELECTION_NONCREATURES: ([CARD_TYPE_CREATURE], False, False, True),
-    CARD_TYPE_SELECTION_NON_LANDS: ([CARD_TYPE_CREATURE, CARD_TYPE_PLANESWALKER, CARD_TYPE_INSTANT, CARD_TYPE_SORCERY, CARD_TYPE_ENCHANTMENT, CARD_TYPE_ARTIFACT], True, False, True),
+    CARD_TYPE_SELECTION_NON_LANDS: (
+        [
+            CARD_TYPE_CREATURE,
+            CARD_TYPE_PLANESWALKER,
+            CARD_TYPE_INSTANT,
+            CARD_TYPE_SORCERY,
+            CARD_TYPE_ENCHANTMENT,
+            CARD_TYPE_ARTIFACT,
+        ],
+        True,
+        False,
+        True,
+    ),
 }
 
-TABLE_PROPORTIONS = [
-    (1,),
-    (.75, .25),
-    (.60, .20, .20),
-    (.46, .18, .18, .18)
-]
+TABLE_PROPORTIONS = [(1,), (0.75, 0.25), (0.60, 0.20, 0.20), (0.46, 0.18, 0.18, 0.18)]
 
+# TODO: Where are these values from?
+# My understanding is this array is an array for values for each of the first six packs
+# The four values are used in a numpy polyval with the ALSA
+# Meaning if you have a card with an ALSA of 7.2 in pack #1, then your wheel % would be
+# -0.46*(7.2^3) + 7.97*(7.2^2) - 27.43*7.2 + 26.61 = 70.6% (69.4% in MTGAZone article)
+# For pack #6: 0.25*(7.2^3) +-2.65*(7.2^2) + 9.76*7.2 - 11.21 = 15.0% (13.0% in MTGAZone article)
+# The numbers seem reasonable, but don't know if it is generalized from a set's draft data?
+# https://mtgazone.com/how-to-wheel-in-drafts/ is the best I could find online and the percentages are close
 WHEEL_COEFFICIENTS = [
     [-0.46, 7.97, -27.43, 26.61],
     [-0.33, 6.31, -23.12, 23.86],
@@ -588,6 +832,10 @@ CARD_RARITY_DICT = {
 }
 
 UI_SIZE_DICT = {
+    "40%": 0.4,
+    "50%": 0.5,
+    "60%": 0.6,
+    "70%": 0.7,
     "80%": 0.8,
     "90%": 0.9,
     "100%": 1.0,
@@ -605,5 +853,88 @@ UI_SIZE_DICT = {
     "220%": 2.2,
     "230%": 2.3,
     "240%": 2.4,
-    "250%": 2.5
+    "250%": 2.5,
 }
+
+PICK_TWO_EVENT_STRING = "PickTwo"
+
+CARD_RATINGS_BACKOFF_DELAY_SECONDS = 30
+CARD_RATINGS_INTER_DELAY_SECONDS = 1
+CARD_RATINGS_ATTEMPT_MAX = 5
+
+# --- MANA FIXING HEURISTICS ---
+# Substrings to search for in card oracle text (Case Insensitive)
+FIXING_KEYWORDS = [
+    # Direct Production (Any Color)
+    "mana of any color",
+    "mana of any one color",
+    "mana of any type",
+    "mana of the chosen color",
+    # "Choose a color" usually implies fixing (e.g. Thriving lands, Unknown Shores)
+    "choose a color",
+    # Fetching / Tutoring
+    "search your library for a land card",
+    "search your library for a basic land",
+    "search your library for a land",
+    "search your library for a plains",
+    "search your library for an island",
+    "search your library for a swamp",
+    "search your library for a mountain",
+    "search your library for a forest",
+    "search your library for up to two basic land cards",
+    "search your library for up to X basic land cards",
+    "basic landcycling",
+    "plainscycling",
+    "islandcycling",
+    "swampcycling",
+    "mountaincycling",
+    "forestcycling",
+    # Token Generation (Treasure/Gold)
+    "create a treasure",
+    "create x treasure",
+    "create a gold token",
+    # Enchantments
+    "whenever enchanted land is tapped for mana, its controller adds an additional one mana of any color",
+]
+
+# Cards with these strings in their NAME are likely fixers.
+FIXING_NAMES = [
+    "riveteers overlook",
+    "brokers hideout",
+    "cabaretti courtyard",
+    "maestros theater",
+    "obscura storefront",
+    "great hall",
+    "cactus preserve",
+    "guild globe",
+    "omenpath journey",
+]
+
+DATA_FIELD_TAGS = "tags"
+
+# Map internal Scryfall tags to UI-friendly icons and labels
+TAG_VISUALS = {
+    "removal": "🎯 Removal",
+    "evasion": "🦅 Evasion",
+    "card_advantage": "📚 Advantage",
+    "fixing_ramp": "🌈 Fixing",  # Changed from 🌱 Mana/Fix
+    "fixing": "🌈 Fixing",  # Catch-all in case the internal tag was renamed
+    "combat_trick": "⚔️ Trick",
+    "enhancement": "🛡️ Enhance",
+    "token_maker": "👯 Tokens",
+    "lifegain": "💖 Lifegain",
+    "mana_sink": "⚙️ Sink",
+    "protection": "🛡️ Protect",
+    "hate": "🚫 Hate",
+}
+
+# Known corrupted mappings returned by 17Lands API
+CARD_NAME_CORRECTIONS = {
+    "Bespoke B?": "Bespoke Bō",
+    "Bespoke B": "Bespoke Bō",
+    "Bespoke BÃ´": "Bespoke Bō",
+}
+
+# --- Remote ETL Pipeline ---
+REMOTE_MANIFEST_URL = "https://unrealities.github.io/MTGA_Draft_17Lands/manifest.json"
+REMOTE_DATASET_BASE_URL = "https://unrealities.github.io/MTGA_Draft_17Lands/"
